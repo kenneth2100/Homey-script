@@ -1,0 +1,312 @@
+// ############################################################################
+// 1. Hovedformålet
+// Scriptet sørger for, at hvis du ændrer temperaturen på én termostat, så følger 
+// alle de andre termostater i samme gruppe automatisk med. Det sparer dig for 
+// at skulle lave manuelle flows for hver eneste kombination af termostater 
+// (hvis A ændres -> opdater B, hvis B ændres -> opdater A osv.).
+//
+// 2. De "intelligente" funktioner
+// Scriptet er mere avanceret end et simpelt flow, fordi det håndterer tre udfordringer:
+// - Undgår "Loop-kaos" (Sync Lock): Forhindrer at termostaterne trigger hinanden 
+//   i en uendelig løkke.
+// - Debounce (Ventetid): Venter 3 sekunder (DEBOUNCE_PERIOD_MS) på at du har 
+//   skruet færdig, før det sender signalet videre. Det sparer batteri og netværk.
+// - Automatisk identifikation: Scriptet finder selv termostaterne i dit 
+//   Advanced Flow, som er brugt som "Måltemperatur er ændret" triggere.
+//
+// 3. Hvordan bruger du det i praksis?
+// - Opret et Advanced Flow.
+//   "Måltemperaturen er ændret" og "Termostat-tilstand er ændret".
+// - (Valgfrit) Indsæt dør/vindue sensorer som triggere: "Kontakt-alarmen ændres".
+// - Forbind alle disse triggere til ét kort: "Logik: Kør HomeyScript med argument".
+// - I argument-feltet skal du indsætte ID'et på dit Advanced Flow 
+//   (findes i URL'en i din browser).
+// - Gem scriptet under navnet SyncThermostats.
+// ############################################################################
+
+// ################
+// ### ARGUMENTER
+// #######
+
+const TESTING_FLOW_ID = "63fadb39-9493-491b-b9ff-e36c7c5b68b2"
+
+// ################
+// ### KONFIGURATION
+// #######
+
+// Tid at vente på yderligere opdateringer, før synkroniseringen startes
+const DEBOUNCE_PERIOD_MS  = 3000 
+
+// Afrund måltemperatur til nærmeste 0,5 (f.eks. 20,3 -> 20,5 eller 20,1 -> 20,0)
+const ROUND_TO_NEAREST_HALF = true
+
+// Temperatur der skal sættes, hvis en dør-/vinduessensor er åben
+const WINDOW_OPEN_TEMP = 5
+
+// Sæt til true for at aktivere vinduesdetektering, false for at deaktivere
+const ENABLE_WINDOW_OPEN_DETECTION = true
+
+// Forsinkelse i sekunder før vindueslogik aktiveres (forhindrer aktivering ved hurtig åbning/lukning)
+const WINDOW_OPEN_DELAY_SEC = 30
+
+// Tid at vente mellem enhedsopdateringer for ikke at overbelaste netværket
+const SYNC_GAP_PERIOD_MS  = 100  
+
+// Tid at vente på, at alle opdateringer er anvendt efter sync, før processen låses op
+// Denne forsinkelse forhindrer, at selve synkroniseringen udløser en ny synkronisering
+const POST_SYNC_PERIOD_MS = 1000 
+
+// ################
+// ### INITIALISERING
+// #######
+
+if (!args[0]) 
+{
+  args[0] = TESTING_FLOW_ID
+}
+
+const flowId = args[0]
+const SYNC_LOCK_VAR_NAME = `HomeyScript:SyncThermostats:sync_lock:${flowId}`
+const GLOBAL_TARGET_TEMP_KEY = `flow:${flowId}:newest_target_temperature`
+const RESTORE_STATE_VAR_NAME = `HomeyScript:SyncThermostats:restore_state:${flowId}`
+
+// ################
+// ### SKIP SCRIPTET HVIS NYERE OPDATERINGER ER SKET
+// ### (DEBOUNCE / FORSINKELSE)
+// #######
+
+const timestamp = (new Date()).toISOString();
+global.set(GLOBAL_TARGET_TEMP_KEY, timestamp)
+
+log("Debounce wait START")
+await wait(DEBOUNCE_PERIOD_MS);
+log("Debounce wait FINISH")
+
+const globalTimestamp = global.get(GLOBAL_TARGET_TEMP_KEY)
+if (globalTimestamp != timestamp) 
+{
+  log("There is a newer sync process running. Stopping this sync.")
+  log(`MY TIME: ${timestamp} | ITS TIME: ${globalTimestamp}`)
+  return
+}
+
+/**
+ * Finder alle enheder (termostater og sensorer) fra trigger-kortene i et flow.
+ */
+async function getTriggeredDevices(flowId) {
+    const flow = await Homey.flow.getAdvancedFlow({ id: flowId });
+    log(`Syncing flow triggers for "${flow.name}"`);
+
+    const triggerDeviceIds = [...new Set(Object.values(flow.cards)
+        .filter(card => card.type === 'trigger' && (
+            card.id.endsWith(":target_temperature_changed") ||
+            card.id.endsWith(":thermostat_mode_changed") ||
+            card.id.endsWith(":alarm_contact_changed")
+        ))
+        .map(card => card.ownerUri ? card.ownerUri.split(':').at(-1) : null).filter(id => id))];
+
+    const allDevices = await Promise.all(
+        triggerDeviceIds.map(deviceId => Homey.devices.getDevice({ id: deviceId }))
+    );
+
+    const thermostats = allDevices.filter(d => d.capabilitiesObj && ('target_temperature' in d.capabilitiesObj || 'thermostat_mode' in d.capabilitiesObj));
+    const sensors = allDevices.filter(d => d.capabilitiesObj && 'alarm_contact' in d.capabilitiesObj);
+
+    return { thermostats, sensors, triggerDeviceIds };
+}
+
+/**
+ * Finder den termostat, der senest er blevet opdateret.
+ */
+function findLeaderThermostat(thermostats) {
+    return thermostats
+        .map(device => {
+            const caps = device.capabilitiesObj || {};
+            const tempLast = (caps.target_temperature && caps.target_temperature.lastUpdated) ? Date.parse(caps.target_temperature.lastUpdated) : 0;
+            const modeLast = (caps.thermostat_mode && caps.thermostat_mode.lastUpdated) ? Date.parse(caps.thermostat_mode.lastUpdated) : 0;
+            return {
+                id: device.id,
+                lastUpdated: Math.max(tempLast, modeLast),
+                targetTemperature: caps.target_temperature || null,
+                thermostatMode: caps.thermostat_mode || null,
+            };
+        })
+        .reduce((latest, current) => (current.lastUpdated > latest.lastUpdated ? current : latest));
+}
+
+/**
+ * Synkroniserer den ønskede temperatur og tilstand til alle termostater.
+ */
+async function syncDevices(thermostats, targetTemp, targetMode, skipDeviceId) {
+    if (targetTemp !== null) log(`Target Temp: ${targetTemp}°C`);
+    if (targetMode !== null) log(`Target Mode: ${targetMode}`);
+
+    for (const device of thermostats) {
+        if (skipDeviceId && device.id === skipDeviceId) continue;
+
+        let didUpdate = false;
+
+        // Synkroniser Mode (hvis understøttet og forskellig)
+        if (targetMode !== null && device.capabilitiesObj?.thermostat_mode && device.capabilitiesObj?.thermostat_mode?.value !== targetMode) {
+            log(`Synchronizing Mode on ${device.name} to ${targetMode}...`);
+            try {
+                await device.setCapabilityValue('thermostat_mode', targetMode);
+                // Opdater scriptets lokale hukommelse
+                if (device.capabilitiesObj.thermostat_mode) device.capabilitiesObj.thermostat_mode.value = targetMode;
+                await wait(SYNC_GAP_PERIOD_MS);
+                didUpdate = true;
+            } catch (err) {
+                log(`Fejl ved opdatering af mode på ${device.name}: ${err.message}`);
+            }
+        }
+
+        // Synkroniser Temp (hvis understøttet og forskellig)
+        if (targetTemp !== null && device.capabilitiesObj?.target_temperature && device.capabilitiesObj?.target_temperature?.value !== targetTemp) {
+            log(`Synchronizing Temp on ${device.name} to ${targetTemp}°C...`);
+            try {
+                await device.setCapabilityValue('target_temperature', targetTemp);
+                // Opdater scriptets lokale hukommelse
+                if (device.capabilitiesObj.target_temperature) device.capabilitiesObj.target_temperature.value = targetTemp;
+                await wait(SYNC_GAP_PERIOD_MS);
+                didUpdate = true;
+            } catch (err) {
+                log(`Fejl ved opdatering af temp på ${device.name}: ${err.message}`);
+            }
+        }
+
+        if (!didUpdate) {
+            log(`No need to update ${device.name}`);
+        }
+    }
+}
+
+/**
+ * Hovedfunktionen der orkestrerer hele synkroniseringen.
+ */
+async function main() {
+    // ################
+    // ### LÅSNING AF SYNC-PROCESSEN
+    // #######
+    if (global.get(SYNC_LOCK_VAR_NAME) === true) {
+        log("Another sync is running. Aborting to prevent race condition.");
+        return;
+    }
+
+    let iHoldTheLock = false;
+
+    try {
+        log("Locking sync process.");
+        global.set(SYNC_LOCK_VAR_NAME, true);
+        iHoldTheLock = true;
+
+        let { thermostats, sensors, triggerDeviceIds } = await getTriggeredDevices(flowId);
+
+        log("--- Thermostats ---");
+        if (thermostats.length === 0) {
+            log("No thermostats found in trigger cards. Aborting.");
+            return;
+        }
+        thermostats.forEach(t => log(t.name));
+        log("------");
+
+        const leader = findLeaderThermostat(thermostats);
+
+        // Tjek om nogen vinduer/døre er åbne
+        let openSensor = ENABLE_WINDOW_OPEN_DETECTION
+            ? sensors.find(s => s.capabilitiesObj?.alarm_contact?.value === true)
+            : null;
+
+        // ############################
+        // ### VINDUES-FORSINKELSESLOGIK ###
+        // ############################
+        // Denne komplekse blok håndterer en forsinkelse, før "vindue åbent" reagerer.
+        // Den frigiver midlertidigt låsen, så en "vindue lukket" hændelse kan afbryde ventetiden.
+        if (openSensor && WINDOW_OPEN_DELAY_SEC > 0) {
+            const lastUpdated = new Date(openSensor.capabilitiesObj.alarm_contact.lastUpdated).getTime();
+            const diff = Date.now() - lastUpdated;
+            const delayMs = WINDOW_OPEN_DELAY_SEC * 1000;
+
+            if (diff < delayMs) {
+                log(`Window detected open, but waiting for delay (${Math.round((delayMs - diff) / 1000)}s)...`);
+                global.set(SYNC_LOCK_VAR_NAME, false); // Frigiv lås
+                iHoldTheLock = false;
+                await wait(delayMs - diff);
+                
+                // Vent hvis en anden proces tog låsen (Max 10 sekunder for at undgå uendeligt loop)
+                let lockRetries = 0;
+                while (global.get(SYNC_LOCK_VAR_NAME) === true) { 
+                    await wait(500); 
+                    lockRetries++;
+                    if(lockRetries > 20) throw new Error("Could not re-acquire sync lock after window delay.");
+                } 
+                global.set(SYNC_LOCK_VAR_NAME, true); // Generhverv lås
+                iHoldTheLock = true;
+
+                // Hent frisk data, da status kan have ændret sig under ventetiden
+                const freshDevices = await getTriggeredDevices(flowId);
+                thermostats = freshDevices.thermostats;
+                sensors = freshDevices.sensors;
+                openSensor = sensors.find(s => s.capabilitiesObj?.alarm_contact?.value === true);
+                if (!openSensor) log("Window was closed during wait. Resuming normal sync...");
+            }
+        }
+
+        let targetTemp = null;
+        let targetMode = null;
+        let skipDeviceId = leader.id;
+
+        if (openSensor) {
+            // ### VINDUES-ÅBENT LOGIK ###
+            log(`!! Window/Door Open detected: ${openSensor.name || 'Unknown'} !!`);
+            const savedState = global.get(RESTORE_STATE_VAR_NAME);
+            if (!savedState) {
+                const tempToSave = leader.targetTemperature ? leader.targetTemperature.value : null;
+                if (tempToSave > WINDOW_OPEN_TEMP) {
+                    const stateToSave = { temp: tempToSave, mode: leader.thermostatMode ? leader.thermostatMode.value : null };
+                    global.set(RESTORE_STATE_VAR_NAME, stateToSave);
+                    log(`Saving state before forcing low temp: ${stateToSave.temp}°C / ${stateToSave.mode}`);
+                }
+            }
+            targetTemp = WINDOW_OPEN_TEMP;
+            targetMode = 'off';
+            skipDeviceId = null; // Opdater ALLE enheder
+        } else {
+            // ### NORMAL SYNC LOGIK ###
+            const savedState = global.get(RESTORE_STATE_VAR_NAME);
+            if (savedState) {
+                log(`Window closed. Restoring state: ${savedState.temp}°C / ${savedState.mode}`);
+                targetTemp = savedState.temp;
+                targetMode = savedState.mode; // Gendan gemt mode, eller null hvis ingen var gemt
+                global.set(RESTORE_STATE_VAR_NAME, null); // Ryd hukommelsen
+                skipDeviceId = null; // Tving opdatering til alle enheder
+            } else {
+                // Almindelig synkronisering
+                targetTemp = leader.targetTemperature ? leader.targetTemperature.value : null;
+                targetMode = leader.thermostatMode ? leader.thermostatMode.value : null;
+                log(`Newest Update from Device ID: ${leader.id}`);
+            }
+        }
+
+        // Anvend afrunding hvis aktiveret
+        if (ROUND_TO_NEAREST_HALF && targetTemp !== null) {
+            targetTemp = Math.round(targetTemp * 2) / 2;
+        }
+
+        await syncDevices(thermostats, targetTemp, targetMode, skipDeviceId);
+
+        await wait(POST_SYNC_PERIOD_MS);
+    } catch (err) {
+        log.error("Error during sync:", err);
+        await Homey.notifications.createNotification({
+            excerpt: `Thermostat Sync Fejl: ${err.message || err}`
+        });
+    } finally {
+        if (iHoldTheLock) {
+            global.set(SYNC_LOCK_VAR_NAME, false);
+            log("Lock released.");
+        }
+    }
+}
+
+// Kør hovedfunktionen
+await main();
