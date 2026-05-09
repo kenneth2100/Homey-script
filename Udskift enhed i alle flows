@@ -1,0 +1,315 @@
+// Device Replacement Script
+
+// Disse navne bruges KUN til at finde enhedernes unikke ID'er. 
+const oldDeviceName = "NAVNET PÅ DIN GAMLE ENHED"; 
+const newDeviceName = "NAVNET PÅ DIN NYE ENHED";
+const dryRun = true; // Sæt til false for at udføre ændringerne rigtigt
+const swapDevices = false; // Sæt til true for at bytte om på enhederne (swap)
+const updateScripts = false; // Sæt til false for at springe opdatering af Homey Scripts over
+
+const PROTECTION_TOKEN = "###_SELF_PROTECTION_TOKEN_###"; // Forhindrer scriptet i at ændre sig selv
+
+async function main() {
+    const devices = await Homey.devices.getDevices();
+    
+    // Hjælpefunktion til pauser (skåner Homey ved mange opdateringer)
+    const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // Hjælpefunktion til at sikre ID'er i Regex ikke ødelægger søgningen
+    const escapeRegExp = (string) => {
+        return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    // Find enheder og tjek for dubletter for at undgå fejl
+    const oldDevices = Object.values(devices).filter(d => d.name === oldDeviceName);
+    const newDevices = Object.values(devices).filter(d => d.name === newDeviceName);
+
+    if (oldDevices.length === 0) {
+        return log(`❌ Fejl: Kunne ikke finde enheden med navnet "${oldDeviceName}".`);
+    }
+    if (newDevices.length === 0) {
+        return log(`❌ Fejl: Kunne ikke finde enheden med navnet "${newDeviceName}".`);
+    }
+    if (oldDevices.length > 1) {
+        const ids = oldDevices.map(d => d.id).join(', ');
+        return log(`❌ Fejl: Fandt ${oldDevices.length} enheder med navnet "${oldDeviceName}". Vælg et unikt navn. Fundne ID'er: ${ids}`);
+    }
+    if (newDevices.length > 1) {
+        const ids = newDevices.map(d => d.id).join(', ');
+        return log(`❌ Fejl: Fandt ${newDevices.length} enheder med navnet "${newDeviceName}". Vælg et unikt navn. Fundne ID'er: ${ids}`);
+    }
+
+    const oldDevice = oldDevices[0];
+    const newDevice = newDevices[0];
+
+    if (swapDevices) {
+        log(`🔄 SWAP AKTIVERET: Bytter om på '${oldDevice.name}' og '${newDevice.name}' i alle flows...`);
+    } else {
+        log(`Erstatter '${oldDevice.name}' (${oldDevice.id}) med '${newDevice.name}' (${newDevice.id}) i alle flows...`);
+    }
+    
+    // SIKKERHEDSTJEK: Sammenlign enhederne før start
+    if (oldDevice.class !== newDevice.class) {
+        log(`\n⚠️  ADVARSEL: Enhederne er ikke af samme type! (${oldDevice.class} vs ${newDevice.class})`);
+    }
+    
+    // Tjek om den nye enhed mangler capabilities som den gamle havde
+    const missingCaps = oldDevice.capabilities.filter(c => !newDevice.capabilities.includes(c));
+    if (missingCaps.length > 0) {
+        log(`⚠️  ADVARSEL: Den nye enhed mangler følgende funktioner: ${missingCaps.join(', ')}`);
+        log(`    Flows der bruger disse funktioner vil sandsynligvis fejle!\n`);
+    }
+    
+    // Ved swap: Tjek også den modsatte vej (hvis vi flytter fra Ny -> Gammel)
+    const reverseMissingCaps = newDevice.capabilities.filter(c => !oldDevice.capabilities.includes(c));
+    if (swapDevices && reverseMissingCaps.length > 0) {
+        log(`⚠️  ADVARSEL (Swap): Den gamle enhed mangler funktioner som den nye enhed har: ${reverseMissingCaps.join(', ')}`);
+    }
+
+    let count = 0;
+    let totalMatches = 0;
+    const riskyFlows = [];
+
+    // Pre-kompiler RegExp for 'swap' så den ikke genereres tusindvis af gange i rekursionen
+    const swapRegex = new RegExp(`${escapeRegExp(oldDevice.id)}|${escapeRegExp(newDevice.id)}`, 'g');
+
+    // Hjælpefunktion til at søge og erstatte i flow-kort
+    const processCards = (cards, flowName, section = 'Kort') => {
+        let changed = false;
+        if (!Array.isArray(cards)) return false;
+        
+        // Rekursiv funktion til at håndtere nested objekter og tekst-strenge
+        const traverseAndReplace = (obj, path = '') => {
+            let modified = false;
+            if (!obj || typeof obj !== 'object') return false;
+
+            for (const key in obj) {
+                const val = obj[key];
+                const currentPath = path ? `${path}.${key}` : key;
+
+                // 1. Direkte ID match
+                if (val === oldDevice.id) {
+                    log(`   🔹 [${flowName}] (${section}) -> Argument '${currentPath}':`);
+                    log(`      -> Erstatter ID: ${oldDevice.name} => ${newDevice.name}`);
+                    totalMatches++;
+                    if (!dryRun) obj[key] = newDevice.id;
+                    modified = true;
+                } else if (swapDevices && val === newDevice.id) {
+                    log(`   🔹 [${flowName}] (${section}) -> Argument '${currentPath}':`);
+                    log(`      -> Bytter ID (Swap): ${newDevice.name} => ${oldDevice.name}`);
+                    totalMatches++;
+                    if (!dryRun) obj[key] = oldDevice.id;
+                    modified = true;
+                }
+                // 2. Tekst-streng der indeholder ID'et (f.eks. HomeyScript argument eller JSON)
+                else if (typeof val === 'string') {
+                    if (swapDevices && (val.includes(oldDevice.id) || val.includes(newDevice.id))) {
+                        log(`   🔹 [${flowName}] (${section}) -> Tekstfelt '${currentPath}':`);
+                        log(`      -> Bytter ID'er i tekststreng`);
+                        totalMatches++;
+                        if (!dryRun) {
+                            obj[key] = val.replace(swapRegex, (m) => m === oldDevice.id ? newDevice.id : oldDevice.id);
+                        }
+                        modified = true;
+                    } else if (!swapDevices && val.includes(oldDevice.id)) {
+                        log(`   🔹 [${flowName}] (${section}) -> Tekstfelt '${currentPath}':`);
+                        log(`      -> Erstatter ID i tekststreng`);
+                        totalMatches += val.split(oldDevice.id).length - 1;
+                        if (!dryRun) obj[key] = val.split(oldDevice.id).join(newDevice.id);
+                        modified = true;
+                    }
+                }
+                // 3. Objekt/Array (Rekursion)
+                else if (val && typeof val === 'object') {
+                    let objectHandled = false; // Flag til at stoppe rekursion hvis objektet blev byttet
+
+                    // Tjek specifikt for device-objekt struktur
+                    if (!Array.isArray(val) && val.id === oldDevice.id) {
+                        log(`   🔹 [${flowName}] (${section}) -> Objekt '${currentPath}':`);
+                        log(`      -> Opdaterer enheds-objekt: ${oldDevice.name} => ${newDevice.name}`);
+                        totalMatches++;
+                        if (!dryRun) {
+                            val.id = newDevice.id;
+                            if (val.name) val.name = newDevice.name;
+                        }
+                        modified = true;
+                        objectHandled = true;
+                    } else if (!Array.isArray(val) && swapDevices && val.id === newDevice.id) {
+                        log(`   🔹 [${flowName}] (${section}) -> Objekt '${currentPath}':`);
+                        log(`      -> Opdaterer enheds-objekt (Swap): ${newDevice.name} => ${oldDevice.name}`);
+                        totalMatches++;
+                        if (!dryRun) {
+                            val.id = oldDevice.id;
+                            if (val.name) val.name = oldDevice.name;
+                        }
+                        modified = true;
+                        objectHandled = true;
+                    }
+                    // NYT: Håndtering af Tag/Token titler (hvis tagget indeholder enhedsnavnet)
+                    else if (!Array.isArray(val) && val.uri && typeof val.uri === 'string') {
+                        if (val.uri.includes(oldDevice.id) && val.title && typeof val.title === 'string' && val.title.includes(oldDeviceName)) {
+                            log(`   🔹 [${flowName}] (${section}) -> Tag/Token '${currentPath}':`);
+                            log(`      -> Omdøber Tag-titel: '${oldDeviceName}' => '${newDeviceName}'`);
+                            if (!dryRun) val.title = val.title.replace(oldDeviceName, newDeviceName);
+                            modified = true;
+                        } else if (swapDevices && val.uri.includes(newDevice.id) && val.title && typeof val.title === 'string' && val.title.includes(newDeviceName)) {
+                            log(`   🔹 [${flowName}] (${section}) -> Tag/Token (Swap) '${currentPath}':`);
+                            log(`      -> Omdøber Tag-titel: '${newDeviceName}' => '${oldDeviceName}'`);
+                            if (!dryRun) val.title = val.title.replace(newDeviceName, oldDeviceName);
+                            modified = true;
+                        }
+                    }
+                    
+                    // Gå kun dybere ned i strukturen, hvis vi IKKE allerede har håndteret/byttet dette objekt.
+                    // Dette forhindrer "double swap" hvor vi bytter A->B, og rekursionen straks bytter B->A tilbage.
+                    if (!objectHandled && traverseAndReplace(val, currentPath)) modified = true;
+                }
+            }
+            return modified;
+        };
+
+        for (const card of cards) {
+            let cardChanged = false;
+            // Tjek Owner URI (VIGTIGT: Dette håndterer triggers/actions der "tilhører" enheden)
+            if (card.ownerUri && card.ownerUri.includes(oldDevice.id)) {
+                log(`   🔹 [${flowName}] (${section}) -> Kort ejer (ownerUri):`);
+                log(`      -> Opdaterer kort-ejer: ${oldDevice.name} => ${newDevice.name}`);
+                if (!dryRun) {
+                    card.ownerUri = card.ownerUri.replace(oldDevice.id, newDevice.id);
+                }
+                totalMatches++;
+                cardChanged = true;
+            } else if (swapDevices && card.ownerUri && card.ownerUri.includes(newDevice.id)) {
+                log(`   🔹 [${flowName}] (${section}) -> Kort ejer (ownerUri):`);
+                log(`      -> Opdaterer kort-ejer (Swap): ${newDevice.name} => ${oldDevice.name}`);
+                if (!dryRun) {
+                    card.ownerUri = card.ownerUri.replace(newDevice.id, oldDevice.id);
+                }
+                totalMatches++;
+                cardChanged = true;
+            }
+
+            if (card.args && traverseAndReplace(card.args)) {
+                cardChanged = true;
+            }
+            if (card.droptokens && traverseAndReplace(card.droptokens)) {
+                cardChanged = true;
+            }
+            if (card.token && traverseAndReplace(card.token)) {
+                cardChanged = true;
+            }
+
+            if (cardChanged) {
+                changed = true;
+                // Tjek om kortet bruger en manglende capability (Brug ?. for at undgå fejl hvis args mangler)
+                if (missingCaps.length > 0) {
+                    const usedCap = card.group || card.args?.capability;
+                    if (usedCap && missingCaps.includes(usedCap)) {
+                        const msg = `Flow '${flowName}' bruger '${usedCap}'`;
+                        if (!riskyFlows.includes(msg)) riskyFlows.push(msg);
+                    }
+                }
+            }
+        }
+        return changed;
+    };
+
+    // Hent og gennemgå alle standard flows
+    const flows = await Homey.flow.getFlows();
+    for (const flow of Object.values(flows)) {
+        let flowModified = false;
+        // Brug ?. for at undgå fejl hvis en sektion mangler
+        if (processCards(flow.trigger, flow.name, 'Trigger')) flowModified = true;
+        if (processCards(flow.conditions, flow.name, 'Betingelse')) flowModified = true;
+        if (processCards(flow.actions, flow.name, 'Handling')) flowModified = true;
+        // VIGTIGT: Husk også "Ellers" (Else) sektionen!
+        if (flow.actionsAny && processCards(flow.actionsAny, flow.name, 'Ellers (Else)')) flowModified = true;
+
+        if (flowModified) {
+            log(`Opdaterer flow: ${flow.name}`);
+            count++;
+            if (!dryRun) {
+                try {
+                    await Homey.flow.updateFlow({ id: flow.id, flow: flow });
+                } catch (err) { log(`   ❌ Fejl ved opdatering af flow '${flow.name}':`, err); }
+                await wait(50); // Lille pause for stabilitet
+            }
+        }
+    }
+
+    // Hent og gennemgå alle Advanced Flows
+    const advancedFlows = await Homey.flow.getAdvancedFlows();
+    for (const flow of Object.values(advancedFlows)) {
+        // Advanced Flows gemmer kort i et 'cards' objekt. Vi bruger Object.values for at få dem som en liste.
+        if (flow.cards && processCards(Object.values(flow.cards), flow.name, 'Advanced Flow')) {
+            log(`Opdaterer Advanced Flow: ${flow.name}`);
+            count++;
+            if (!dryRun) {
+                try {
+                    await Homey.flow.updateAdvancedFlow({ id: flow.id, flow: flow });
+                } catch (err) { log(`   ❌ Fejl ved opdatering af Advanced Flow '${flow.name}':`, err); }
+                await wait(50); // Lille pause for stabilitet
+            }
+        }
+    }
+
+    // Hent og gennemgå Homey Scripts
+    if (updateScripts) {
+        log('\n🔍 Tjekker Homey Scripts...');
+        try {
+            const scripts = await Homey.api('GET', '/app/com.athom.homeyscript/scripts');
+            for (const scriptId of Object.keys(scripts)) {
+                const script = scripts[scriptId];
+                if (!script.code) continue; 
+
+                if (script.code.includes(PROTECTION_TOKEN)) {
+                    log(`      🛡️  Springer script '${script.name}' over (det er dette script)`);
+                    continue;
+                }
+
+                let code = script.code;
+                let scriptModified = false;
+                let matchCount = 0;
+
+                if (swapDevices) {
+                    if (code.includes(oldDevice.id) || code.includes(newDevice.id)) {
+                        const matches = code.match(swapRegex);
+                        if (matches) {
+                            matchCount = matches.length;
+                            log(`   📜 [Script: ${script.name}] -> Fandt ${matchCount} ID-matches til Swap`);
+                            if (!dryRun) code = code.replace(swapRegex, (m) => m === oldDevice.id ? newDevice.id : oldDevice.id);
+                            scriptModified = true;
+                        }
+                    }
+                } else {
+                    if (code.includes(oldDevice.id)) {
+                        matchCount = code.split(oldDevice.id).length - 1;
+                        log(`   📜 [Script: ${script.name}] -> Fandt ${matchCount} forekomster af gammelt ID`);
+                        if (!dryRun) code = code.split(oldDevice.id).join(newDevice.id);
+                        scriptModified = true;
+                    }
+                }
+
+                if (scriptModified) {
+                    totalMatches += matchCount;
+                    if (!dryRun) await Homey.api('PUT', `/app/com.athom.homeyscript/script/${scriptId}`, { code: code });
+                    log(`      ${dryRun ? 'ℹ️  (DryRun) Ville opdatere' : '✅ Opdaterede'} script '${script.name}'`);
+                    if (!dryRun) await wait(50);
+                }
+            }
+        } catch (err) { log(`❌ Kunne ikke behandle scripts (API fejl): ${err.message}`); }
+    } else {
+        log('\n⏭️  Springer Homey Scripts over (deaktiveret i indstillinger).');
+    }
+    
+    log(`Færdig! ${count} flows ${dryRun ? "ville blive" : "blev"} opdateret (i alt ${totalMatches} udskiftninger).`);
+    
+    if (riskyFlows.length > 0) {
+        log("\n⚠️  Følgende flows vil sandsynligvis fejle pga. manglende capabilities:");
+        riskyFlows.forEach(f => log(`   - ${f}`));
+    }
+
+    if (dryRun) log("Dette var en test (dryRun). Sæt dryRun = false i scriptet for at gemme ændringerne.");
+}
+
+main().catch(console.error);
