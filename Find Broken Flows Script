@@ -1,5 +1,25 @@
-// Find Broken Flows Script
-// Dette script finder flows med kort, der refererer til slettede enheder.
+/**
+ * ==============================================================================
+ * Find Broken Flows Script (Find Ødelagte Flows)
+ * ==============================================================================
+ * 
+ * Beskrivelse:
+ * Dette script gennemgår automatisk hele dit Homey-system for at finde flows,
+ * der indeholder fejl eller "ødelagte" kort. Dette sker typisk, når en enhed, 
+ * variabel, zone, bruger eller app er blevet slettet, men stadig bruges i et flow.
+ * 
+ * Hovedfunktioner:
+ * - Scanner både Standard Flows og Advanced Flows.
+ * - Finder referencer til slettede enheder, manglende apps, logic-variabler, tags/tokens, brugere og zoner.
+ * - Opretter/opdaterer automatisk en Homey Logic variabel med en statusrapport.
+ * - Returnerer "true", hvis der findes fejl (kan bruges som et "Og..."-kort til at udløse en notifikation i et flow).
+ * 
+ * Vejledning:
+ * 1. Gennemgå konfigurationssektionen lige under denne boks.
+ * 2. Tilpas evt. hvilke flows der skal ignoreres via 'IGNORE_FLOWS'.
+ * 3. Kør scriptet manuelt, eller sæt det til at køre automatisk (f.eks. én gang om ugen via et flow).
+ * ==============================================================================
+ */
 
 // ################
 // ### KONFIGURATION
@@ -32,13 +52,13 @@ async function findBrokenCards() {
 
     // 1. Hent alt systemdata parallelt for lynhurtig indlæsning
     const [devices, appsList, logicVars, zones, users, flows, advancedFlows] = await Promise.all([
-        Homey.devices.getDevices(),
-        Homey.apps.getApps(),
-        Homey.logic.getVariables(),
-        Homey.zones.getZones(),
-        Homey.users.getUsers(),
-        Homey.flow.getFlows(),
-        Homey.flow.getAdvancedFlows()
+        Homey.devices.getDevices().catch(() => ({})),
+        Homey.apps.getApps().catch(() => ({})),
+        Homey.logic.getVariables().catch(() => ({})),
+        Homey.zones.getZones().catch(() => ({})),
+        Homey.users.getUsers().catch(() => ({})),
+        Homey.flow.getFlows().catch(() => ({})),
+        Homey.flow.getAdvancedFlows().catch(() => ({}))
     ]);
 
     const validDeviceIds = new Set(Object.keys(devices));
@@ -170,7 +190,7 @@ async function findBrokenCards() {
                 }
 
                 if (val && typeof val === 'object' && val.id && typeof val.name === 'string' && /device|sensor|light|speaker|camera|lock|thermostat|button|remote|hub/i.test(key)) {
-                    if (val.id.length > 20 && !validDeviceIds.has(val.id)) {
+                    if (typeof val.id === 'string' && val.id.length > 20 && !validDeviceIds.has(val.id)) {
                         isBroken = true;
                         category = 'device';
                         reason = `Indstillingen '${key}' peger på '${val.name}', men denne findes ikke.`;
@@ -373,7 +393,7 @@ async function findBrokenCards() {
             targetVar = await Homey.logic.createVariable({ name: BROKEN_FLOWS_VAR_NAME, type: 'string' });
             log(`✅ Oprettede ny variabel: '${BROKEN_FLOWS_VAR_NAME}'`);
         } catch (err) {
-            log(`❌ Fejl ved oprettelse af variabel: ${err.message}`);
+            console.error(`❌ Fejl ved oprettelse af variabel: ${err.message}`);
         }
     }
 
