@@ -1,4 +1,25 @@
-// Device Replacement Script
+/**
+ * ==============================================================================
+ * Homey Device Replacement & Swap Script
+ * ==============================================================================
+ * 
+ * Beskrivelse:
+ * Dette script automatiserer udskiftningen af en gammel enhed med en ny i hele 
+ * dit Homey-system. Det gennemsøger og opdaterer Standard Flows, Advanced Flows 
+ * og valgfrit HomeyScripts.
+ * 
+ * Hovedfunktioner:
+ * - Erstatning: Erstatter alle referencer fra den gamle enhed til den nye.
+ * - Swap (Bytte): Kan bytte om på to enheder, så de overtager hinandens plads (valgfrit).
+ * - Dry-run: Test ændringerne sikkert i loggen uden at gemme noget (anbefales først).
+ * - Tjek af Capabilities: Advarer hvis den nye enhed mangler funktioner som den gamle havde.
+ * 
+ * Vejledning:
+ * 1. Indtast de præcise navne på dine enheder i 'oldDeviceName' og 'newDeviceName'.
+ * 2. Behold 'dryRun = true' og kør scriptet for at se ændringerne i loggen.
+ * 3. Ret 'dryRun = false' og kør scriptet igen for rent faktisk at gemme ændringerne.
+ * ==============================================================================
+ */
 
 // Disse navne bruges KUN til at finde enhedernes unikke ID'er. 
 const oldDeviceName = "NAVNET PÅ DIN GAMLE ENHED"; 
