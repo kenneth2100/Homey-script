@@ -1,0 +1,451 @@
+// Find Broken Flows Script
+// Dette script finder flows med kort, der refererer til slettede enheder.
+
+// ################
+// ### KONFIGURATION
+// #######
+const BROKEN_FLOWS_VAR_NAME = "Broken flows";
+
+// Tilføj navne på flows, som scriptet skal ignorere, i denne liste.
+// Eksempel: const IGNORE_FLOWS = [ "Gammelt julelys flow", "Test flow" ];
+const IGNORE_FLOWS = [];
+
+// Sæt til true for at ignorere flows, der er deaktiverede
+const IGNORE_DISABLED_FLOWS = true;
+
+// Sæt til true for at skjule log-beskeder i konsollen (godt hvis scriptet kører automatisk)
+const SILENT_MODE = false;
+
+// Sæt til true for at se tekniske detaljer i konsollen (bruges til fejlfinding)
+const DEBUG_MODE = false;
+
+async function findBrokenCards() {
+    function log(...args) {
+        if (!SILENT_MODE) console.log(...args);
+    }
+
+    function debug(...args) {
+        if (DEBUG_MODE) console.log('🐞', ...args);
+    }
+
+    log("🔍 Starter dybdegående søgning efter ødelagte flows...\n");
+
+    // 1. Hent alt systemdata parallelt for lynhurtig indlæsning
+    const [devices, appsList, logicVars, zones, users, flows, advancedFlows] = await Promise.all([
+        Homey.devices.getDevices(),
+        Homey.apps.getApps(),
+        Homey.logic.getVariables(),
+        Homey.zones.getZones(),
+        Homey.users.getUsers(),
+        Homey.flow.getFlows(),
+        Homey.flow.getAdvancedFlows()
+    ]);
+
+    const validDeviceIds = new Set(Object.keys(devices));
+    
+    const apps = {};
+    if (Array.isArray(appsList)) appsList.forEach(a => apps[a.id] = a);
+    else Object.assign(apps, appsList);
+    const validAppIds = new Set(Object.keys(apps));
+
+    const validVarIds = new Set(Object.keys(logicVars));
+    const validZoneIds = new Set(Object.keys(zones));
+    const validUserIds = new Set(Object.keys(users));
+    const validFlowIds = new Set([...Object.keys(flows), ...Object.keys(advancedFlows)]);
+
+    // Hent alle Tokens (Tags) - Vi starter med Logic-variabler, da de også er tokens
+    let validTokenIds = new Set(validVarIds); 
+    let canCheckTokens = true; // Vi kan altid tjekke logic-tokens
+    let foundExtendedTokens = false;
+
+    const tokenDiscoveryMethods = [
+        async () => Homey.flowToken && (await Homey.flowToken.getFlowTokens()).map(t => t.id),
+        async () => Homey.flowToken && (await Homey.flowToken.getTokens()).map(t => t.id),
+        async () => Homey.flow && Object.keys(await Homey.flow.getTokens()),
+        async () => Homey.flow && (await Homey.flow.getFlowTokens()).map(t => t.id)
+    ];
+
+    for (const method of tokenDiscoveryMethods) {
+        try {
+            const ids = await method();
+            if (ids && Array.isArray(ids)) {
+                ids.forEach(id => validTokenIds.add(id));
+                foundExtendedTokens = true;
+                debug("Tags indlæst succesfuldt.");
+                break;
+            }
+        } catch (e) { /* Prøv næste metode */ }
+    }
+
+    if (!foundExtendedTokens && DEBUG_MODE) {
+        log("ℹ️  System-tags kunne ikke hentes, men Logic-tags valideres stadig.");
+    }
+
+    debug(`Indlæst data: ${validDeviceIds.size} enheder, ${validAppIds.size} apps, ${validVarIds.size} variabler, ${validTokenIds.size} tags, ${validUserIds.size} brugere.`);
+
+    let deviceIssuesCount = 0;
+    let variableIssuesCount = 0;
+    let zoneIssuesCount = 0;
+    let tokenIssuesCount = 0;
+    let userIssuesCount = 0;
+
+    const brokenDeviceFlowsWithDetails = [];
+    const brokenVariableFlowsWithDetails = [];
+    const brokenZoneFlowsWithDetails = [];
+    const brokenTokenFlowsWithDetails = [];
+    const brokenUserFlowsWithDetails = [];
+
+    const uniqueBrokenFlowNames = new Set();
+    const missingCounts = {};
+
+    // Hjælpefunktion til at tjekke et enkelt kort
+    function checkCard(card, flowName, flowType) {
+        let isBroken = false;
+        let reason = "";
+        let category = 'device'; // Standardkategori
+        let missingItemName = "";
+
+        debug(`   > Tjekker kort: ${card.id} (Owner: ${card.ownerUri || 'Ingen'})`);
+
+        // TJEK 0: Er kortet markeret som ødelagt af Homey selv?
+        if (card.broken === true) {
+            isBroken = true;
+            reason = `Homey har markeret dette kort som ødelagt (f.eks. pga. manglende app eller systemfejl).`;
+            missingItemName = `System-markeret fejl`;
+        }
+
+        // TJEK 1: Ejer (Owner URI)
+        // Dette fanger triggers/actions der tilhører en specifik enhed (f.eks. "Tænd lyset")
+        if (card.ownerUri && card.ownerUri.startsWith('homey:device:')) {
+            const deviceId = card.ownerUri.split(':').pop();
+            if (!validDeviceIds.has(deviceId)) {
+                isBroken = true;
+                reason = `Kortet tilhører en enhed, der er slettet (ID: ${deviceId})`;
+                missingItemName = `Slettet enhed (ID: ${deviceId})`;
+            }
+        }
+        
+        // TJEK 1b: Ejer (App) - Tjek om appen bag kortet er slettet eller deaktiveret
+        if (!isBroken && card.ownerUri && card.ownerUri.startsWith('homey:app:')) {
+            const appId = card.ownerUri.split(':').pop();
+            const app = apps[appId];
+            if (!app) {
+                isBroken = true;
+                reason = `Kortet tilhører en app, der er slettet (App ID: ${appId})`;
+                missingItemName = `Slettet App (${appId})`;
+            } else if (app.enabled === false) {
+                isBroken = true;
+                reason = `Kortet tilhører appen '${app.name}', som er deaktiveret.`;
+                missingItemName = `Deaktiveret App (${app.name})`;
+            }
+        }
+
+        // TJEK 2: Argumenter (Args)
+        // Dette fanger kort der refererer til en enhed (f.eks. "Cast til Google Nest" eller Logic variabler)
+        if (!isBroken && card.args) {
+            // Gennemgå alle argumenter for at se om de ligner en enhed
+            for (const key in card.args) {
+                const val = card.args[key];
+
+                // Tjek for Tags/Tokens (findes ofte i dropdowns eller som værdier)
+                if (canCheckTokens && val && typeof val === 'object' && val.type === 'token' && val.id) {
+                    if (!validTokenIds.has(val.id) && !validVarIds.has(val.id)) {
+                        isBroken = true;
+                        category = 'token';
+                        reason = `Refererer til et slettet Tag/Token: '${val.name || val.id}'`;
+                        missingItemName = `Slettet Tag (${val.name || val.id})`;
+                        break;
+                    }
+                }
+
+                // Tjek for Brugere (f.eks. i notifikationer)
+                if (key === 'user' && val && typeof val === 'object' && val.id) {
+                    if (!validUserIds.has(val.id)) {
+                        isBroken = true;
+                        category = 'user';
+                        reason = `Refererer til en slettet bruger: '${val.name || val.id}'`;
+                        missingItemName = `Slettet Bruger (${val.name || val.id})`;
+                        break;
+                    }
+                }
+
+                if (val && typeof val === 'object' && val.id && typeof val.name === 'string' && /device|sensor|light|speaker|camera|lock|thermostat|button|remote|hub/i.test(key)) {
+                    if (val.id.length > 20 && !validDeviceIds.has(val.id)) {
+                        isBroken = true;
+                        category = 'device';
+                        reason = `Indstillingen '${key}' peger på '${val.name}', men denne findes ikke.`;
+                        missingItemName = val.name || `Ukendt Enhed (${val.id})`;
+                        break;
+                    }
+                }
+
+                // Tilfælde B: Argumentet hedder eksplicit 'device' og er en streng (ID)
+                if (key === 'device' && typeof val === 'string' && val.length > 20) {
+                    if (!validDeviceIds.has(val)) {
+                        isBroken = true;
+                        category = 'device';
+                        reason = `Feltet 'device' indeholder et ID på en slettet enhed.`;
+                        missingItemName = `Slettet enhed (ID: ${val})`;
+                        break;
+                    }
+                }
+
+                // Tjek for Logic variabler (nøglen 'variable' bruges oftest i standard Logic kort)
+                if (key === 'variable' && val && typeof val === 'object' && val.id) {
+                    if (!validVarIds.has(val.id)) {
+                        isBroken = true;
+                        category = 'variable';
+                        reason = `Refererer til en slettet Logic-variabel: '${val.name || 'Ukendt'}'`;
+                        missingItemName = val.name || `Ukendt Variabel (${val.id})`;
+                        break;
+                    }
+                }
+
+                // Tjek for referencer til andre Flows (nøglen 'flow' bruges typisk ved Start Flow kort)
+                if (key === 'flow' && val && typeof val === 'object' && val.id) {
+                    if (!validFlowIds.has(val.id)) {
+                        isBroken = true;
+                        category = 'device'; // Vi grupperer det under "enhed/system" fejl
+                        reason = `Refererer til et slettet Flow: '${val.name || 'Ukendt'}'`;
+                        missingItemName = val.name || `Ukendt Flow (${val.id})`;
+                        break;
+                    }
+                }
+
+                // Tjek for Zoner (nøglen 'zone' bruges oftest)
+                if (key === 'zone' && val && typeof val === 'object' && val.id) {
+                    if (!validZoneIds.has(val.id)) {
+                        isBroken = true;
+                        category = 'zone';
+                        reason = `Refererer til en slettet Zone: '${val.name || 'Ukendt'}'`;
+                        missingItemName = val.name || `Ukendt Zone (${val.id})`;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // TJEK 3: Droptokens (Tags trukket ind i tekstfelter)
+        if (canCheckTokens && !isBroken && card.droptokens && Array.isArray(card.droptokens)) {
+            for (const tokenId of card.droptokens) {
+                if (!validTokenIds.has(tokenId) && !validVarIds.has(tokenId)) {
+                    isBroken = true;
+                    category = 'token';
+                    reason = `Et 'Tag' anvendt i et tekstfelt er slettet (ID: ${tokenId})`;
+                    missingItemName = `Slettet Tag i tekstfelt`;
+                    break;
+                }
+            }
+        }
+
+        if (isBroken) {
+            // Find pænt navn på kilden (App eller System)
+            let sourceName = card.id;
+            
+            if (card.id.startsWith('homey:app:')) {
+                const appId = card.id.split(':')[2];
+                const app = apps[appId];
+                sourceName = app ? `App: ${app.name}` : `App ID: ${appId}`;
+            } else if (card.id.startsWith('homey:manager:')) {
+                const managerId = card.id.split(':')[2];
+                sourceName = `System: ${managerId.charAt(0).toUpperCase() + managerId.slice(1)}`;
+            }
+            
+            let typeLabel;
+            if (category === 'token') {
+                typeLabel = '🏷️ TAG/TOKEN';
+            } else if (category === 'user') {
+                typeLabel = '👤 BRUGER';
+            } else if (category === 'variable') {
+                typeLabel = '🔢 VARIABEL';
+            } else if (category === 'zone') {
+                typeLabel = '📍 ZONE';
+            } else {
+                typeLabel = '🔌 ENHED';
+            }
+
+            log(`❌ [${typeLabel}] [${flowType}] "${flowName}"`);
+            log(`   └─ Kilde: ${sourceName} (${card.id.split(':').pop()})`);
+            log(`   └─ Fejl: ${reason}`);
+
+            uniqueBrokenFlowNames.add(`[${flowType}] ${flowName}`);
+
+            if (category === 'token') {
+                tokenIssuesCount++;
+                brokenTokenFlowsWithDetails.push(`[${flowType}] "${flowName}" → ${reason}`);
+            } else if (category === 'user') {
+                userIssuesCount++;
+                brokenUserFlowsWithDetails.push(`[${flowType}] "${flowName}" → ${reason}`);
+            } else if (category === 'variable') {
+                variableIssuesCount++;
+                brokenVariableFlowsWithDetails.push(`[${flowType}] "${flowName}" → ${reason}`);
+            } else if (category === 'zone') {
+                zoneIssuesCount++;
+                brokenZoneFlowsWithDetails.push(`[${flowType}] "${flowName}" → ${reason}`);
+            } else {
+                deviceIssuesCount++;
+                brokenDeviceFlowsWithDetails.push(`[${flowType}] "${flowName}" → ${reason}`);
+            }
+
+            if (missingItemName) {
+                missingCounts[missingItemName] = (missingCounts[missingItemName] || 0) + 1;
+            }
+        }
+    }
+
+    // Valider ignoreringslisten
+    if (IGNORE_FLOWS.length > 0) {
+        const allFlowNames = new Set([
+            ...Object.values(flows).map(f => f.name),
+            ...Object.values(advancedFlows).map(f => f.name)
+        ]);
+
+        for (const ignoredFlowName of IGNORE_FLOWS) {
+            if (!allFlowNames.has(ignoredFlowName)) {
+                log(`⚠️  Advarsel: Flowet "${ignoredFlowName}" fra ignoreringslisten blev ikke fundet.`);
+            }
+        }
+        log(''); // Tilføj et linjeskift for læsbarhed
+    }
+
+    // 3. Tjek Standard Flows
+    for (const flow of Object.values(flows)) {
+        // Spring over flows, der er på ignoreringslisten
+        if (IGNORE_FLOWS.includes(flow.name)) {
+            debug(`Springer over ignoreret flow: "${flow.name}"`);
+            continue;
+        }
+
+        // Tjek for deaktiverede flows
+        if (IGNORE_DISABLED_FLOWS && !flow.enabled) {
+            debug(`Springer over deaktiveret flow: "${flow.name}"`);
+            continue;
+        }
+
+        debug(`Analyserer flow: "${flow.name}"`);
+        // Tjek triggers, conditions og actions
+        if (flow.trigger) checkCard(flow.trigger, flow.name, "Flow");
+        flow.conditions.forEach(c => checkCard(c, flow.name, "Flow"));
+        flow.actions.forEach(a => checkCard(a, flow.name, "Flow"));
+        
+        // Nogle standard flows har en "Ellers" (Else) del, som kan ligge i actionsAny (afhængig af API version)
+        if (flow.actionsAny) flow.actionsAny.forEach(a => checkCard(a, flow.name, "Flow"));
+    }
+
+    // 4. Tjek Advanced Flows
+    for (const flow of Object.values(advancedFlows)) {
+        // Spring over flows, der er på ignoreringslisten
+        if (IGNORE_FLOWS.includes(flow.name)) {
+            debug(`Springer over ignoreret Advanced Flow: "${flow.name}"`);
+            continue;
+        }
+
+        // Tjek for deaktiverede Advanced Flows
+        if (IGNORE_DISABLED_FLOWS && !flow.enabled) {
+            debug(`Springer over deaktiveret Advanced Flow: "${flow.name}"`);
+            continue;
+        }
+
+        debug(`Analyserer Advanced Flow: "${flow.name}"`);
+        const cards = Object.values(flow.cards);
+        for (const card of cards) {
+            checkCard(card, flow.name, "Advanced Flow");
+        }
+    }
+
+    const totalIssues = deviceIssuesCount + variableIssuesCount + zoneIssuesCount + tokenIssuesCount + userIssuesCount;
+    log(`\n🏁 SCAN FÆRDIG!`);
+    log(`📊 Status: Fandt ${totalIssues} fejl.`);
+
+    if (totalIssues > 0) {
+        log(`\n⚠️  FUNDNE PROBLEMER (${totalIssues}):`);
+        log("--------------------------------------------------");
+        const allDetails = [...brokenDeviceFlowsWithDetails, ...brokenVariableFlowsWithDetails, ...brokenZoneFlowsWithDetails, ...brokenTokenFlowsWithDetails, ...brokenUserFlowsWithDetails];
+        allDetails.sort().forEach(detail => log(`• ${detail}`));
+        log("--------------------------------------------------\n");
+    }
+
+    const currentVars = await Homey.logic.getVariables();
+    let targetVar = Object.values(currentVars).find(v => v.name === BROKEN_FLOWS_VAR_NAME);
+
+    if (!targetVar) {
+        try {
+            targetVar = await Homey.logic.createVariable({ name: BROKEN_FLOWS_VAR_NAME, type: 'string' });
+            log(`✅ Oprettede ny variabel: '${BROKEN_FLOWS_VAR_NAME}'`);
+        } catch (err) {
+            log(`❌ Fejl ved oprettelse af variabel: ${err.message}`);
+        }
+    }
+
+    if (targetVar) {
+        let newValue;
+        const now = new Date();
+        const pad = (n) => n.toString().padStart(2, '0');
+        const months = ['jan.', 'feb.', 'mar.', 'apr.', 'maj', 'jun.', 'jul.', 'aug.', 'sep.', 'okt.', 'nov.', 'dec.'];
+        const timestamp = `${now.getDate()}. ${months[now.getMonth()]} ${now.getFullYear()} kl. ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+
+        if (totalIssues > 0) {
+            const allUniqueFlowsCount = uniqueBrokenFlowNames.size;
+            
+            let parts = [
+                `Scan afsluttet: ${timestamp}`,
+                `Resultat: Fandt ${totalIssues} fejl fordelt på ${allUniqueFlowsCount} unikke flows.`
+            ];
+            
+            if (deviceIssuesCount > 0) {
+                parts.push(`\n--- 🔌 ENHEDS FEJL (${deviceIssuesCount} fundet) ---`);
+                parts.push(`Disse flows refererer til enheder, der er slettet.`);
+                parts.push(brokenDeviceFlowsWithDetails.sort().join('\n'));
+            }
+
+            if (variableIssuesCount > 0) {
+                parts.push(`\n--- 🔢 VARIABEL FEJL (${variableIssuesCount} fundet) ---`);
+                parts.push(`Disse flows bruger Logic-variabler, der er slettet.`);
+                parts.push(brokenVariableFlowsWithDetails.sort().join('\n'));
+            }
+
+            if (zoneIssuesCount > 0) {
+                parts.push(`\n--- 📍 ZONE FEJL (${zoneIssuesCount} fundet) ---`);
+                parts.push(`Disse flows bruger Zoner, der er slettet.`);
+                parts.push(brokenZoneFlowsWithDetails.sort().join('\n'));
+            }
+
+            if (tokenIssuesCount > 0) {
+                parts.push(`\n--- 🏷️ TAG FEJL (${tokenIssuesCount} fundet) ---`);
+                parts.push(`Disse flows bruger Tags (f.eks. fra enheder), der er slettet.`);
+                parts.push(brokenTokenFlowsWithDetails.sort().join('\n'));
+            }
+
+            if (userIssuesCount > 0) {
+                parts.push(`\n--- 👤 BRUGER FEJL (${userIssuesCount} fundet) ---`);
+                parts.push(`Disse flows refererer til brugere, der ikke længere findes.`);
+                parts.push(brokenUserFlowsWithDetails.sort().join('\n'));
+            }
+
+            if (Object.keys(missingCounts).length > 0) {
+                parts.push(`\n--- 📊 FEJL STATISTIK (Top manglende) ---`);
+                Object.entries(missingCounts)
+                    .sort((a, b) => b[1] - a[1]) // Sorter efter antal (højest først)
+                    .forEach(([name, count]) => parts.push(`${count}x ${name}`));
+            }
+
+            newValue = parts.join('\n');
+        } else {
+            newValue = `Scan afsluttet: ${timestamp}\nAlt OK`;
+        }
+
+        // Sikkerhed: Klip teksten af, hvis den er for lang til en Homey variabel (ca. 4000 tegn)
+        if (newValue.length > 3500) {
+            newValue = newValue.substring(0, 3500) + "\n... (listen er afkortet pga. længde)";
+        }
+
+        await Homey.logic.updateVariable({ id: targetVar.id, variable: { value: newValue } });
+        log(`✅ Opdaterede variablen '${BROKEN_FLOWS_VAR_NAME}' med listen over fejl.`);
+    }
+
+    // Returner true hvis der er fejl, så flowet kan reagere (OG...)
+    return totalIssues > 0;
+}
+
+// Kør funktionen og returner resultatet til Homey Flow
+return await findBrokenCards();
