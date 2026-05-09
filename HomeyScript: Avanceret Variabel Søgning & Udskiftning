@@ -1,0 +1,222 @@
+/**
+ * =========================================================================
+ * HomeyScript: Avanceret Variabel Søgning & Udskiftning (Find & Replace)
+ * =========================================================================
+ * Dette script giver dig fuldt overblik over variabler og tags i din Homey.
+ * 
+ * Nøglefunktioner:
+ * - SØG ('SEARCH'): Scanner alle Standard Flows, Advanced Flows, HomeyScripts,
+ *   Logic Variabler og Tokens for at finde præcis hvor et navn bruges.
+ * - UDSKIFT ('REPLACE'): Omdøber variablen på tværs af hele systemet.
+ * - DRY RUN: Sikkerhedsmekanisme der lader dig simulere en udskiftning først, 
+ *   så du præcist kan se hvad der vil blive ændret uden at gemme noget.
+ * - SIKKERHED: Indbygget beskyttelse mod specialtegn og system-reserverede 
+ *   ord, så du ikke kan komme til at korrumpere dine flows.
+ * =========================================================================
+ */
+
+const ACTION = 'SEARCH'; // Vælg 'SEARCH' (kun visning af hvor variablen bruges) eller 'REPLACE' (udskift variablen)
+const variableToFind = 'nat lys'; 
+const newVariableName = 'nyt lys'; // Det nye variabelnavn (kun relevant hvis ACTION = 'REPLACE')
+const dryRun = true; // Sæt til false for at udføre faktiske ændringer ved 'REPLACE'!
+
+// Hjælpefunktion til at "escape" specialtegn i tekst, så de ikke ødelægger vores RegExp
+function escapeRegExp(string) {
+    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& betyder hele det matchede tegn
+}
+
+async function findVariableUsage() {
+    // 1. Validering af input før vi overhovedet starter
+    if (typeof variableToFind !== 'string' || variableToFind.trim() === '') {
+        console.error('❌ Afbrudt: "variableToFind" er tom. Angiv venligst, hvad der skal søges efter.');
+        return false;
+    }
+
+    // Sikkerhedsliste mod at ødelægge Homeys JSON-struktur ved REPLACE
+    const reservedWords = ['id', 'name', 'type', 'uri', 'args', 'token', 'droptokens', 'folder', 'true', 'false', 'null', 'undefined'];
+    if (ACTION === 'REPLACE' && reservedWords.includes(variableToFind.toLowerCase())) {
+        console.error(`❌ Afbrudt: Du forsøger at udskifte et system-reserveret ord ("${variableToFind}"). Dette vil korrumpere dine flows!`);
+        return false;
+    }
+
+    // Valider kun det nye navn, hvis vi reelt ønsker at udskifte (REPLACE)
+    if (ACTION === 'REPLACE') {
+        if (typeof newVariableName !== 'string' || newVariableName.trim() === '') {
+            console.error('❌ Afbrudt: "newVariableName" er tom eller ugyldig. Udfyld venligst et gyldigt nyt navn.');
+            return false;
+        }
+        if (newVariableName.includes('"') || newVariableName.includes('\\')) {
+            console.error('❌ Afbrudt: "newVariableName" indeholder ulovlige tegn (" eller \\). Dette vil ødelægge Homeys JSON-struktur!');
+            return false;
+        }
+    }
+
+    // Hent alt data parallelt og sikkert (fanger evt. fejl, hvis et API ikke er tilgængeligt)
+    const [allFlows, allAdvancedFlows, allFolders, allScripts, allLogicVars, allTokens] = await Promise.all([
+        Homey.flow.getFlows().catch(() => ({})),
+        Homey.flow.getAdvancedFlows().catch(() => ({})),
+        (typeof Homey.flow.getFolders === 'function') ? Homey.flow.getFolders().catch(() => ({})) : Promise.resolve({}),
+        (Homey.script && typeof Homey.script.getScripts === 'function') ? Homey.script.getScripts().catch(() => ({})) : Promise.resolve({}),
+        (Homey.logic && typeof Homey.logic.getVariables === 'function') ? Homey.logic.getVariables().catch(() => ({})) : Promise.resolve({}),
+        (Homey.flow && typeof Homey.flow.getTokens === 'function') ? Homey.flow.getTokens().catch(() => ({})) : Promise.resolve({})
+    ]);
+
+    let findings = [];
+    
+    const escapedVariable = escapeRegExp(variableToFind);
+    
+    // Lookbehinds/Lookaheads bruges i stedet for \b, da det også understøtter specialtegn som parenteser i starten/slutningen af navnet
+    const searchRegex = new RegExp('(?<!\\w)' + escapedVariable + '(?!\\w)', 'i');
+    const replaceRegex = new RegExp('(?<!\\w)' + escapedVariable + '(?!\\w)', 'gi');
+
+    console.log(`🔍 Starter i [${ACTION}] tilstand for variablen: "${variableToFind}"...\n`);
+
+    // Gennemgå standard flows
+    for (const flow of Object.values(allFlows)) {
+        const flowString = JSON.stringify(flow);
+        if (searchRegex.test(flowString)) {
+            const folderName = flow.folder ? (allFolders[flow.folder]?.name ?? `ID: ${flow.folder}`) : 'Ingen mappe';
+            findings.push({ Type: 'Standard Flow', Navn: flow.name, Mappe: folderName });
+
+            if (ACTION === 'REPLACE') {
+                const updatedFlowString = flowString.replace(replaceRegex, newVariableName);
+                if (dryRun) {
+                    console.log(`   -> 🧪 [DRY RUN] Ville auto-opdatere flow: "${flow.name}"`);
+                } else {
+                    try {
+                        const parsedFlow = JSON.parse(updatedFlowString);
+                        await Homey.flow.updateFlow({ id: flow.id, flow: parsedFlow });
+                        console.log(`   -> 🔄 Auto-opdaterede flow: "${flow.name}"`);
+                    } catch (err) {
+                        console.error(`   -> ❌ Fejl ved opdatering (JSON/API) for flow "${flow.name}": ${err.message}`);
+                    }
+                }
+            }
+        }
+    }
+
+    // Gennemgå Advanced Flows
+    for (const advFlow of Object.values(allAdvancedFlows)) {
+        const advFlowString = JSON.stringify(advFlow);
+        if (searchRegex.test(advFlowString)) {
+            const folderName = advFlow.folder ? (allFolders[advFlow.folder]?.name ?? `ID: ${advFlow.folder}`) : 'Ingen mappe';
+            findings.push({ Type: 'Advanced Flow', Navn: advFlow.name, Mappe: folderName });
+
+            if (ACTION === 'REPLACE') {
+                const updatedAdvFlowString = advFlowString.replace(replaceRegex, newVariableName);
+                if (dryRun) {
+                    console.log(`   -> 🧪 [DRY RUN] Ville auto-opdatere advanced flow: "${advFlow.name}"`);
+                } else {
+                    try {
+                        const parsedAdvFlow = JSON.parse(updatedAdvFlowString);
+                        await Homey.flow.updateAdvancedFlow({ id: advFlow.id, advancedFlow: parsedAdvFlow });
+                        console.log(`   -> 🔄 Auto-opdaterede advanced flow: "${advFlow.name}"`);
+                    } catch (err) {
+                        console.error(`   -> ❌ Fejl ved opdatering (JSON/API) for advanced flow "${advFlow.name}": ${err.message}`);
+                    }
+                }
+            }
+        }
+    }
+
+    // Gennemgå HomeyScripts
+    for (const script of Object.values(allScripts)) {
+        if (script.code && searchRegex.test(script.code)) {
+            findings.push({ Type: 'HomeyScript', Navn: script.name, Mappe: 'Scripts' });
+
+            if (ACTION === 'REPLACE') {
+                const updatedCode = script.code.replace(replaceRegex, newVariableName);
+                if (dryRun) {
+                    console.log(`   -> 🧪 [DRY RUN] Ville auto-opdatere HomeyScript: "${script.name}"`);
+                } else {
+                    try {
+                        // Vi kopierer det eksisterende script-objekt og overskriver kun koden
+                        const updatedScriptObj = { ...script, code: updatedCode };
+                        await Homey.script.updateScript({ id: script.id, script: updatedScriptObj });
+                        console.log(`   -> 🔄 Auto-opdaterede HomeyScript: "${script.name}"`);
+                    } catch (err) {
+                        console.error(`   -> ❌ Fejl ved opdatering af HomeyScript: ${err.message}`);
+                    }
+                }
+            }
+        }
+    }
+
+    // Gennemgå Homey Logic Variabler
+    for (const logicVar of Object.values(allLogicVars)) {
+        // For variabler tjekker vi det præcise navn (ignorerer dog store/små bogstaver)
+        if (logicVar.name.toLowerCase() === variableToFind.toLowerCase()) {
+            findings.push({ Type: 'Logic Variabel', Navn: logicVar.name, Mappe: 'Homey Logic' });
+
+            if (ACTION === 'REPLACE') {
+                if (dryRun) {
+                    console.log(`   -> 🧪 [DRY RUN] Ville auto-omdøbe Logic variabel: "${logicVar.name}" til "${newVariableName}"`);
+                } else {
+                    try {
+                        await Homey.logic.updateVariable({ id: logicVar.id, variable: { name: newVariableName } });
+                        console.log(`   -> 🔄 Auto-omdøbte Logic variabel: "${logicVar.name}" til "${newVariableName}"`);
+                    } catch (err) {
+                        console.error(`   -> ❌ Fejl ved omdøbning af Logic variabel: ${err.message}`);
+                    }
+                }
+            }
+        }
+    }
+
+    // Gennemgå Indbyggede Tags (Tokens)
+    for (const token of Object.values(allTokens)) {
+        const tokenName = token.title || token.name || '';
+        if (tokenName.toLowerCase() === variableToFind.toLowerCase()) {
+            // Spring over Logic variabler, da vi allerede har dækket dem ovenfor
+            if (token.uri && token.uri.includes('homey:manager:logic')) continue;
+            
+            findings.push({ Type: 'Indbygget Tag', Navn: tokenName, Mappe: token.uri || 'System' });
+
+            if (ACTION === 'REPLACE') {
+                console.log(`   -> ⚠️ [ADVARSEL] Tagget "${tokenName}" er et system-tag (URI: ${token.uri}). Scriptet opdaterer dine flows, men selve kilde-tagget kan ikke omdøbes automatisk.`);
+            }
+        }
+    }
+
+    // Præsentation af resultater
+    if (findings.length > 0) {
+        console.log(`✅ Fundet ${findings.length} steder:`);
+        
+        // Gruppér resultaterne efter type
+        const groupedFindings = findings.reduce((acc, curr) => {
+            if (!acc[curr.Type]) acc[curr.Type] = [];
+            acc[curr.Type].push(curr);
+            return acc;
+        }, {});
+
+        // Udskriv grupperet
+        for (const [type, items] of Object.entries(groupedFindings)) {
+            console.log(`\n📌 ${type} (${items.length}):`);
+            
+            // Sorter items alfabetisk efter mappenavn, og derefter efter navn hvis mappen er ens
+            items.sort((a, b) => a.Mappe.localeCompare(b.Mappe) || a.Navn.localeCompare(b.Navn));
+            
+            items.forEach(f => {
+                console.log(`   - Navn: "${f.Navn}" | Mappe: "${f.Mappe}"`);
+            });
+        }
+        
+        if (ACTION === 'REPLACE' && dryRun) {
+            console.log('\n⚠️ Dette var en Dry Run test (intet er ændret). Sæt "const dryRun = false;" for at gemme ændringerne!');
+        } else if (ACTION === 'SEARCH') {
+            console.log('\n🔎 Søgning fuldført. Ingen ændringer foretaget (ACTION er sat til SEARCH).');
+        }
+    } else {
+        console.log('❌ Variablen blev ikke fundet i nogen flows.');
+    }
+    
+    try {
+        await tag('Antal_Variabler_Fundet', findings.length);
+    } catch (err) {
+        console.error(`⚠️ Kunne ikke opdatere system-tag 'Antal_Variabler_Fundet': ${err.message}`);
+    }
+
+    return findings.length > 0;
+}
+
+await findVariableUsage();
