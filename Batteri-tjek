@@ -1,0 +1,488 @@
+// ============================================
+// Batteristatus-tjek for Homey Pro
+// ============================================
+// Flow-triggere:
+// - Når dette script kører og returnerer 'true' → Der er nye alarmer/løste sager.
+// - Når tag "BatteryAlertToKenneth" opdateres → Send push til dig med tag-værdien.
+//
+// BESKRIVELSE AF FUNKTION:
+// Dette script fungerer som en avanceret og intelligent vagthund for dit Homey-system.
+// Det overvåger proaktivt sundheden af alle dine batteridrevne enheder og sensorer.
+//
+// NØGLEFUNKTIONER:
+// 1. INGEN SPAM (State-håndtering): Scriptet husker tidligere advarsler. Du får kun 
+//    besked, når et problem er NYT, eller når problemet endelig er løst.
+// 2. 'SUDDEN DROP' DETEKTION: Fanger enheder (ofte Zigbee), der pludselig dør eller 
+//    falder drastisk, selvom de for nylig rapporterede et højt batteriniveau.
+// 3. DETEKTION AF INAKTIVITET (DØDE ENHEDER): Overvåger sikkerhedssensorer og advarer, 
+//    hvis de i stilhed er stoppet med at kommunikere med din Homey.
+// 4. PÅMINDELSER: Sender en venlig reminder, hvis et problem har været uløst i X dage.
+// 5. AUTOMATISK KUITTERING: Registrerer selv, når du har skiftet batteriet eller 
+//    vækket enheden, og sender dig en grøn "løst"-kvittering.
+//
+// Scriptet er "Plug & Play" og opretter automatisk de nødvendige logik-variabler 
+// for at opretholde state og forhindre konflikter ved samtidige kørsler.
+//
+// ÆNDRINGSLOG:
+// - Tilføjet state-håndtering via en Homey-variabel for at undgå gentagne alarmer.
+// - Sender kun alarm for NYE enheder med lavt batteri.
+// - Rapporterer når en enheds batteri er blevet skiftet/opladet.
+// - Tilføjet påmindelse for uløste problemer efter et bestemt antal dage.
+// - Tilføjet mulighed for at slå state-håndtering til/fra.
+// - Tilføjet ignorering af enheder med 100% batteri (f.eks. USB-enheder).
+// - Tilføjet understøttelse af enheder der kun har 'alarm_battery' (ingen procent).
+// - Rettet visning af rumnavne (zone lookup).
+// - Tilføjet opsummering af ignorerede enheder i loggen.
+// - Tilføjet tjek for inaktive enheder (døde enheder der ikke opdaterer).
+// - Tilføjet mulighed for at ekskludere specifikke enheder KUN fra inaktivitets-tjekket.
+// - **ROBUSTHED**: Bruger nu enheds-ID i stedet for navn til state-håndtering.
+// - **ROBUSTHED**: Tilføjet try/catch omkring Homey API-kald for at undgå script-crash.
+// - **ROBUSTHED**: Implementeret en låsemekanisme for at forhindre samtidige kørsler (race conditions).
+// - **FIX**: Rettet "sudden drop"-detektion for batteriniveauer der er 0.
+// - **FIX**: Bruger JSON.parse/stringify i stedet for structuredClone (understøttes ikke i HomeyScript).
+
+// Konfiguration
+const CONFIG = {
+  BATTERY_THRESHOLD: 15,                    // Procent – under dette sendes advarsel
+  BATTERY_CRITICAL_THRESHOLD: 5,            // Ekstra advarsel ved meget lavt batteri
+  REMINDER_DAYS: 7,                         // Antal dage før en påmindelse sendes for et uløst problem
+  TAG_NAME: 'DeviceReport',                 // Tag til fuld rapport over ALLE enheder med lavt batteri
+  ALERT_TAG_NAME: 'BatteryAlertToKenneth',  // Tag til alarm-besked med NYE problemer
+
+  // Nogle enheder (især Zigbee) rapporterer 100% indtil de dør. Sæt til true for at opdage pludselige fald.
+  // Kræver USE_STATE_HANDLING = true.
+
+  CHECK_INACTIVITY: true,                   // Tjek om enheder er stoppet med at opdatere (døde enheder)
+  MAX_INACTIVITY_HOURS: 168,                // Timer uden opdatering før enhed anses for inaktiv (168 = 7 dage)
+  // Enheder der sjældent rapporterer (f.eks. dørkontakt på gæsteværelse) kan ekskluderes fra inaktivitetstjek.
+  EXCLUDE_INACTIVITY_DEVICES: [],           // Ignorer disse enheder KUN for inaktivitets-tjek, f.eks. ['Postkasse Sensor']
+  
+  DETECT_SUDDEN_DROPS: true,
+  EXCLUDED_DEVICES: [],                     // Liste af navne på enheder der skal ignoreres fuldstændig, f.eks. ['Gæsteværelse', 'Fjernbetjening']
+  IGNORE_100_PERCENT_BATTERY: true,         // Ignorer enheder der rapporterer 100% (f.eks. USB-enheder)
+  ENABLE_PUSH: true,                        // Sæt til true/false for at aktivere/deaktivere push (via ALERT_TAG_NAME)
+
+  // Sæt til 'true' for kun at få én alarm pr. batteriskift (kræver opsætning af variabel nedenfor).
+  // Sæt til 'false' for at få en alarm HVER gang scriptet kører, hvis der er problemer.
+  USE_STATE_HANDLING: true,
+  
+  // Navn på den logik-variabel (Tekst), der gemmer state for enheder. Scriptet opretter den selv.
+  STATE_VARIABLE_NAME: 'BatteryMonitorState',
+
+  // --- Avanceret robusthed ---
+  // Navn på en logik-variabel (Ja/Nej) til at forhindre samtidige kørsler. Scriptet opretter den selv.
+  LOCK_VARIABLE_NAME: 'BatteryMonitorLock',
+  LOCK_TIMEOUT_MS: 30000,                   // 30 sekunder før en lås anses for forældet.
+  MAX_MESSAGE_LENGTH: 8000,                 // Max længde for push-beskeder for at undgå trunkering.
+};
+
+// --- Start af script ---
+
+// Funktion til at parse state. Håndterer nu kun det nye ID-baserede JSON-format.
+// Nulstiller state hvis det gamle format detekteres, for at sikre en ren overgang.
+function parseAlertState(value) {
+  if (typeof value !== 'string' || !value) {
+    return {};
+  }
+  try {
+    const state = JSON.parse(value);
+    if (typeof state === 'object' && state !== null && !Array.isArray(state)) {
+      // Tjek om state bruger det gamle, navne-baserede format.
+      // Heuristik: Homey enheds-ID'er er UUID'er. Hvis en nøgle ikke ligner en UUID, er det sandsynligvis det gamle format.
+      const isOldFormat = Object.keys(state).some(key => !/^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(key));
+      if (isOldFormat) {
+        log('ADVARSEL: Gammelt state-format (baseret på enhedsnavne) detekteret. State nulstilles for at skifte til robust ID-baseret sporing. Du kan modtage en enkelt runde af "nye" alarmer.');
+        return {};
+      }
+      return state;
+    }
+  } catch (e) {
+    // Dette fanger både det gamle CSV-format (som ikke er JSON) og korrupt JSON.
+    log('ADVARSEL: Kunne ikke parse state. Det kan være det gamle CSV-format eller korrupt data. State nulstilles. Du kan modtage en enkelt runde af "nye" alarmer.');
+  }
+  return {};
+}
+
+// Funktion til at afkorte beskeder, så de ikke bliver klippet af Homey.
+function truncateMessage(message, maxLength) {
+  if (message.length <= maxLength) {
+    return message;
+  }
+  const ellipsis = '... (besked afkortet)';
+  return message.substring(0, maxLength - ellipsis.length) + ellipsis;
+}
+
+// Funktion til at opdatere et tag sikkert
+async function safeTagUpdate(name, value) {
+  try {
+    await tag(name, value);
+  } catch (e) {
+    log(`Fejl ved opdatering af tag '${name}': ${e.message}`);
+  }
+}
+
+// Funktion til automatisk at finde eller oprette variabler
+async function getOrCreateVariable(name, type, defaultValue) {
+  try {
+    const variables = await Homey.logic.getVariables();
+    let variable = Object.values(variables).find(v => v.name === name);
+    if (variable) {
+      if (variable.type !== type) {
+        throw new Error(`Findes, men med forkert type (forventede ${type}, er ${variable.type}). Slet den gamle i Homey.`);
+      }
+      return variable;
+    }
+    log(`ℹ️ Logik-variablen '${name}' blev ikke fundet. Opretter den automatisk nu...`);
+    const newVariable = await Homey.logic.createVariable({
+      variable: { name: name, type: type, value: defaultValue }
+    });
+    log(`✅ Variabel '${name}' oprettet succesfuldt!`);
+    return newVariable;
+  } catch (e) {
+    throw new Error(`Kunne ikke finde/oprette variabel '${name}': ${e.message}`);
+  }
+}
+
+// Variabler til state-håndtering
+let deviceStates = {};
+let alertedDevicesVariable = null;
+let lockVariable = null;
+
+// --- Låsemekanisme for at forhindre samtidige kørsler ---
+if (CONFIG.USE_STATE_HANDLING) {
+  try {
+    lockVariable = await getOrCreateVariable(CONFIG.LOCK_VARIABLE_NAME, 'boolean', false);
+
+    if (lockVariable.value === true) {
+      const lastModified = lockVariable.lastUpdated ? new Date(lockVariable.lastUpdated).getTime() : 0;
+      if (Date.now() - lastModified < CONFIG.LOCK_TIMEOUT_MS) {
+        log('Scriptet kører allerede. Afslutter for at undgå race condition.');
+        return false; // Afslut stille
+      }
+      log('ADVARSEL: Låsevariabel var aktiv, men er udløbet. Overtager låsen.');
+    }
+    // Sæt lås
+    await Homey.logic.updateVariable({ id: lockVariable.id, variable: { value: true } });
+    
+    // Dobbelt-tjek for at afhjælpe race conditions (Homey mangler atomic operations)
+    if (typeof wait === 'function') {
+      await wait(Math.random() * 300 + 200);
+    } else if (typeof setTimeout === 'function') {
+      await new Promise(resolve => setTimeout(resolve, Math.random() * 300 + 200));
+    }
+    const lockCheck = await Homey.logic.getVariables();
+    if (lockCheck[lockVariable.id] && lockCheck[lockVariable.id].value === false) {
+      log('Race condition detekteret: En anden instans tog låsen i mellemtiden.');
+      return false;
+    }
+  } catch (e) {
+    const lockError = `Kritisk fejl ved håndtering af låse-variabel: ${e.message}`;
+    log(lockError);
+    await safeTagUpdate(CONFIG.ALERT_TAG_NAME, lockError);
+    return false;
+  }
+}
+
+if (CONFIG.USE_STATE_HANDLING) {
+  log('Kører i avanceret tilstand (med state-håndtering).');
+  try {
+    alertedDevicesVariable = await getOrCreateVariable(CONFIG.STATE_VARIABLE_NAME, 'string', '');
+  } catch (e) {
+    log(`Fejl: ${e.message}`);
+    await safeTagUpdate(CONFIG.ALERT_TAG_NAME, e.message);
+    // Frigiv lås før afslutning
+    if (lockVariable) await Homey.logic.updateVariable({ id: lockVariable.id, variable: { value: false } });
+    return false; // Kan ikke fortsætte uden state-variabel
+  }
+  // Indlæs og parse state fra Homey-variabel
+  deviceStates = parseAlertState(alertedDevicesVariable.value);
+} else {
+  log('Kører i simpel tilstand (uden state-håndtering).');
+}
+
+try {
+  // Hovedlogik
+  const result = await mainLogic();
+  return result;
+} catch (e) {
+  log(`Uventet fejl i scriptets hovedlogik: ${e.message}`);
+  await safeTagUpdate(CONFIG.ALERT_TAG_NAME, `Scriptet fejlede: ${e.message}`);
+  return false;
+} finally {
+  // --- Frigiv lås ---
+  if (CONFIG.USE_STATE_HANDLING && lockVariable) {
+    try {
+      await Homey.logic.updateVariable({ id: lockVariable.id, variable: { value: false } });
+      log('Lås frigivet.');
+    } catch (e) {
+      log(`Fejl ved frigivelse af lås: ${e.message}`);
+    }
+  }
+}
+
+async function mainLogic() {
+  const newDeviceStates = JSON.parse(JSON.stringify(deviceStates)); // Dyb kopi til at arbejde med
+  
+  // Optimering 1: Hent enheder og zoner parallelt
+  const [devices, zones] = await Promise.all([
+    Homey.devices.getDevices(),
+    Homey.zones.getZones()
+  ]);
+
+  // Optimering 2 & 3: Opsæt lynhurtige Sets og forudberegnede tidskonstanter
+  const excludedDevicesSet = new Set(CONFIG.EXCLUDED_DEVICES || []);
+  const excludeInactivitySet = new Set(CONFIG.EXCLUDE_INACTIVITY_DEVICES || []);
+  const MS_PER_HOUR = 3600000;      // 1000 * 60 * 60
+  const MS_PER_DAY = 86400000;      // MS_PER_HOUR * 24
+
+// Sorter enheder efter batteriniveau (lavest først) for bedre overblik
+const sortedDevices = Object.values(devices).sort((a, b) => {
+  const getBat = (d) => d.capabilitiesObj?.measure_battery?.value ?? 100;
+  return getBat(a) - getBat(b);
+});
+
+let fullReport = '';      // Rapport med ALLE enheder med lavt batteri
+let newAlertsReport = ''; // Rapport med KUN nye alarmer
+let resolvedReport = '';  // Rapport med enheder hvor batteri er OK igen
+
+let totalIssues = 0;
+let newIssues = 0;
+let criticalIssues = 0;
+let newCriticalIssues = 0;
+let ignoredCount = 0;
+const activeDeviceIds = new Set(); // Holder styr på enheder der er med i dette tjek
+
+for (const device of sortedDevices) {
+  // Spring over deaktiverede enheder
+  if (device.disabled === true) {
+    log(`Ignorerer ${device.name} (Deaktiveret)`);
+    ignoredCount++;
+    continue;
+  }
+  // Spring over ekskluderede enheder defineret i CONFIG
+  if (excludedDevicesSet.has(device.name)) {
+    log(`Ignorerer ${device.name} (Ekskluderet i CONFIG)`);
+    ignoredCount++;
+    continue;
+  }
+
+  let deviceIssue = false;
+  const deviceName = device.name;
+  const deviceId = device.id;
+  const batteryCap = device.capabilitiesObj?.measure_battery;
+  const alarmBatteryCap = device.capabilitiesObj?.alarm_battery;
+
+  // Spring over enheder der hverken har batteriprocent eller batterialarm
+  if ((!batteryCap || batteryCap.value === null || batteryCap.value === undefined) && !alarmBatteryCap) {
+    continue;
+  }
+
+  // Hent batteriniveau. Hvis enheden ikke har procent-måling, sætter vi den til 100
+  // FIX: Vi sikrer os at værdien tolkes som tal (nogle enheder sender det som tekst)
+  let rawBat = batteryCap?.value;
+  const batteryLevel = (rawBat !== null && rawBat !== undefined && !isNaN(rawBat)) ? Number(rawBat) : 100;
+  const isValidBattery = batteryLevel >= 0 && batteryLevel <= 100;
+
+  // Opdater altid sidst kendte batteriniveau i state, hvis state-håndtering er aktiv.
+  if (CONFIG.USE_STATE_HANDLING) {
+      newDeviceStates[deviceId] = { ...newDeviceStates[deviceId], name: deviceName, lastLevel: batteryLevel };
+  }
+
+  // Tjek inaktivitet (om enheden er "død")
+  let isInactive = false;
+  let inactivityHours = 0;
+  // Filtrer: Tjek inaktivitet på alle sikkerhedssensorer (motion, contact, smoke, water, etc.)
+  const isSecuritySensor = device.capabilitiesObj && Object.keys(device.capabilitiesObj).some(cap => cap.startsWith('alarm_'));
+  const isExcludedFromInactivity = excludeInactivitySet.has(deviceName);
+
+  if (CONFIG.CHECK_INACTIVITY && isSecuritySensor && device.capabilitiesObj && !isExcludedFromInactivity) {
+    let lastUpdateTs = 0;
+    // Find den nyeste opdatering på tværs af alle capabilities (temp, batteri, motion osv.)
+    for (const capKey in device.capabilitiesObj) {
+      const cap = device.capabilitiesObj[capKey];
+      if (cap.lastUpdated) {
+        const ts = new Date(cap.lastUpdated).getTime();
+        if (ts > lastUpdateTs) lastUpdateTs = ts;
+      }
+    }
+    if (lastUpdateTs > 0) {
+      inactivityHours = (Date.now() - lastUpdateTs) / MS_PER_HOUR;
+      if (inactivityHours > CONFIG.MAX_INACTIVITY_HOURS) isInactive = true;
+    }
+  }
+
+  // Marker enheden som aktiv FØR vi evt. ignorerer den pga. 100% batteri eller andet.
+  // Gøres dette ikke, slettes den fra state, og "Sudden Drop" fra 100% vil ikke fungere.
+  activeDeviceIds.add(deviceId);
+  
+  // Ignorer enheder med 100% batteri, hvis konfigureret (fanger ofte USB-enheder)
+  // UNDTAGELSE: Hvis enheden er inaktiv (død), skal vi advare selvom den siger 100%
+  if (CONFIG.IGNORE_100_PERCENT_BATTERY && batteryLevel === 100 && batteryCap && !isInactive) {
+    log(`Ignorerer ${deviceName} (Batteri er 100%)`);
+    ignoredCount++;
+    continue;
+  }
+
+  const issueDetails = [];
+  const currentState = deviceStates[deviceId];
+  const now = new Date();
+
+  // --- Sudden Drop Detection ---
+  // Tjek for pludseligt fald, hvis enheden ikke allerede var i en problemtilstand.
+  if (CONFIG.USE_STATE_HANDLING && CONFIG.DETECT_SUDDEN_DROPS && currentState && !currentState.alertedAt) { 
+    const lastLevel = currentState.lastLevel; // Kan være 0, null eller undefined
+    if (lastLevel != null && lastLevel > CONFIG.BATTERY_THRESHOLD && isValidBattery && batteryLevel <= CONFIG.BATTERY_CRITICAL_THRESHOLD) {
+      issueDetails.unshift(`☠️ Døde pludseligt (fra ${lastLevel}%)`);
+      // Sørg for at dette rapporteres som et problem
+      deviceIssue = true;
+    }
+  }
+
+  // Tilføj inaktivitet til rapporten
+  if (isInactive) {
+    issueDetails.push(`Inaktiv i ${Math.round(inactivityHours)} timer`);
+    deviceIssue = true;
+  }
+
+  let deviceIsCritical = false;
+
+  // Tjek for batterialarm (alarm_battery)
+  if (device.capabilitiesObj?.alarm_battery?.value === true) {
+    issueDetails.push('Batterialarm aktiv');
+    deviceIssue = true;
+    deviceIsCritical = true;
+  }
+
+  if (isValidBattery && batteryLevel <= CONFIG.BATTERY_THRESHOLD) {
+    if (batteryLevel <= CONFIG.BATTERY_CRITICAL_THRESHOLD) {
+      issueDetails.push(`Kritisk lavt batteri (${batteryLevel}%)`);
+      deviceIsCritical = true;
+    } else {
+      issueDetails.push(`Lavt batteri (${batteryLevel}%)`);
+    }
+    deviceIssue = true;
+  }
+
+  // Tjek utilgængelighed for alle enheder der fejler (uanset om det er inaktivitet eller lavt batteri)
+  if (deviceIssue && !device.available) {
+    issueDetails.push('Utilgængelig');
+  }
+
+  if (deviceIsCritical) {
+    criticalIssues++;
+  }
+
+  // Find rumnavn én gang (sikkert opslag)
+  const room = (device.zone && zones[device.zone]) ? zones[device.zone].name : 'Ukendt rum';
+
+  if (deviceIssue) {
+    totalIssues++;
+    let issueLine = `⚠️ ${deviceName} (${room}): ${issueDetails.join(', ')}\n`;
+    fullReport += issueLine;
+
+    let isNewAlert = false;
+    let isReminder = false;
+
+    if (CONFIG.USE_STATE_HANDLING) {
+      if (!currentState?.alertedAt) {
+        isNewAlert = true;
+      } else {
+        const alertDate = new Date(currentState.alertedAt);
+        const daysSinceAlert = (now - alertDate) / MS_PER_DAY;
+        if (daysSinceAlert >= CONFIG.REMINDER_DAYS) {
+          isReminder = true;
+        }
+      }
+    } else {
+      // I simpel tilstand er alt en "ny" alarm
+      isNewAlert = true;
+    }
+
+    if (isNewAlert || isReminder) {
+      newIssues++;
+      if (isReminder) {
+        // Tilføj påmindelses-tekst
+        issueLine = `⚠️ (PÅMINDELSE) ${deviceName} (${room}): ${issueDetails.join(', ')}\n`;
+      }
+      newAlertsReport += issueLine;
+      newDeviceStates[deviceId] = { ...newDeviceStates[deviceId], name: deviceName, alertedAt: now.toISOString() };
+
+      if (deviceIsCritical) {
+        newCriticalIssues++;
+      }
+    }
+  } else if (CONFIG.USE_STATE_HANDLING && currentState?.alertedAt) {
+    // Problem løst! Batteriniveau er OK, og der var en tidligere alarm.
+    resolvedReport += `✅ ${currentState.name || deviceName} (${room}): Batteri OK (${batteryLevel}%)\n`;
+    delete newDeviceStates[deviceId].alertedAt;
+  }
+}
+  
+// Ryd op i state: Fjern enheder fra variablen, som ikke længere findes, er ekskluderet eller deaktiveret
+if (CONFIG.USE_STATE_HANDLING) {
+  Object.keys(newDeviceStates).forEach(storedId => {
+    if (!activeDeviceIds.has(storedId)) {
+      delete newDeviceStates[storedId];
+    }
+  });
+}
+
+// Byg den endelige besked til push-notifikation
+let finalAlertMessage = '';
+if (newIssues > 0) {
+  let header = `Ny batterialarm: ${newIssues} enhed(er) kræver opmærksomhed`;
+  if (newCriticalIssues > 0) {
+    header += ` (${newCriticalIssues} kritisk(e))`;
+  }
+  finalAlertMessage += `${header}:\n\n${newAlertsReport}`;
+}
+if (resolvedReport) {
+  if (finalAlertMessage) finalAlertMessage += '\n'; // Tilføj linjeskift hvis der også er nye alarmer
+  finalAlertMessage += `Følgende er løst:\n${resolvedReport}`;
+}
+
+// Opdater tags
+// Fuld rapport (alle med lavt batteri)
+if (totalIssues > 0) {
+  let header = `Batterirapport: ${totalIssues} enhed(er) med lavt batteri`;
+  if (criticalIssues > 0) {
+    header += ` (${criticalIssues} kritisk(e))`;
+  }
+  const fullReportMessage = truncateMessage(`${header}:\n\n${fullReport}`, CONFIG.MAX_MESSAGE_LENGTH);
+  await safeTagUpdate(CONFIG.TAG_NAME, fullReportMessage);
+} else {
+  await safeTagUpdate(CONFIG.TAG_NAME, 'Alle enheder har tilstrækkeligt batteri.');
+}
+
+// Opdater logik-variablen med den nye liste af enheder (kun i avanceret tilstand)
+if (CONFIG.USE_STATE_HANDLING && alertedDevicesVariable) {
+  const newAlertedValue = JSON.stringify(newDeviceStates);
+  if (newAlertedValue !== alertedDevicesVariable.value) {
+    try {
+      await Homey.logic.updateVariable({
+        id: alertedDevicesVariable.id,
+        variable: { value: newAlertedValue },
+      });
+      log(`Opdateret state-variabel.`);
+    } catch (e) {
+      log(`Fejl ved opdatering af state-variabel: ${e.message}`);
+    }
+  }
+}
+
+log('---------------------------------------------------');
+log(`Opsummering: ${ignoredCount} enhed(er) blev ignoreret (Deaktiveret, ekskluderet eller 100% batteri).`);
+
+// Push-notifikation (kun nye alarmer og løste problemer)
+if (finalAlertMessage) {
+  finalAlertMessage = truncateMessage(finalAlertMessage, CONFIG.MAX_MESSAGE_LENGTH);
+  log(`Sender alarm: ${finalAlertMessage}`);
+  if (CONFIG.ENABLE_PUSH) {
+    await safeTagUpdate(CONFIG.ALERT_TAG_NAME, finalAlertMessage);
+  }
+  return true; // Indikerer at der var noget at rapportere
+} else {
+  log('Ingen nye batteriproblemer eller løste sager at rapportere.');
+  return false; // Indikerer at der ikke var noget nyt
+}
+}
