@@ -51,57 +51,96 @@ function withTimeout(promise, ms, name) {
     return promise;
 }
 
-// Hjælpefunktion til at "escape" specialtegn i tekst, så de ikke ødelægger vores RegExp
-function escapeRegExp(string) {
-    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& betyder hele det matchede tegn
+// Hjælpefunktion til at tjekke om et tegn er et "ord"-tegn (inkl. æøå)
+function isWordChar(char) {
+    return /[a-zA-Z0-9_æøåÆØÅäöüÄÖÜ]/.test(char);
+}
+
+// Manuel søg og erstat der undgår ustabile RegExp lookbehinds og respekterer danske tegn
+function searchAndReplaceWithBoundaries(text, searchStr, replaceStr, performReplace) {
+    if (!text || typeof text !== 'string') return { hasMatch: false, resultText: text };
+    
+    let hasMatch = false;
+    let result = '';
+    let searchLower = searchStr.toLowerCase();
+    let textLower = text.toLowerCase();
+    let i = 0;
+
+    while (i < text.length) {
+        let index = textLower.indexOf(searchLower, i);
+        if (index === -1) {
+            result += text.substring(i);
+            break;
+        }
+
+        let charBefore = index > 0 ? text[index - 1] : null;
+        let charAfter = index + searchStr.length < text.length ? text[index + searchStr.length] : null;
+
+        // Tjekker om grænserne er rigtige (må IKKE være omgivet af andre bogstaver/tal)
+        let boundaryBeforeOk = !charBefore || !isWordChar(charBefore);
+        let boundaryAfterOk = !charAfter || !isWordChar(charAfter);
+
+        if (boundaryBeforeOk && boundaryAfterOk) {
+            hasMatch = true;
+            result += text.substring(i, index);
+            result += performReplace ? replaceStr : text.substring(index, index + searchStr.length);
+        } else {
+            // Ikke et validt match (f.eks. del af et andet ord), behold original tekst
+            result += text.substring(i, index + searchStr.length);
+        }
+        
+        i = index + searchStr.length;
+    }
+
+    return { hasMatch, resultText: result };
 }
 
 // Hjælpefunktion til dyb søgning og sikker udskiftning af string-værdier (beskytter JSON-nøgler)
-function deepSearchAndReplace(obj, searchRegex, replaceRegex, replacementStr, performReplace) {
+function deepSearchAndReplace(obj, searchStr, replacementStr, performReplace) {
     let hasMatch = false;
 
-    // Nøgler vi ALDRIG må ændre indholdet af, da de udgør flowets metadata og fundamentale struktur
-    const protectedKeys = [
-        'id', 'uri', 'ownerUri', 'type', 'token', 'droptokens', 'folder',
-        'name', 'title', 'titleFormatted', 'description', 'createdAt',
-        'modifiedAt', 'icon', 'color', 'metadata', 'version'
+    // Nøgler vi ALDRIG må ændre indholdet af (for at undgå korruption af system-links)
+    const noReplaceKeys = [
+        'id', 'uri', 'ownerUri', 'type', 'token', 'folder',
+        'createdAt', 'modifiedAt', 'icon', 'color', 'version'
+    ];
+
+    // Nøgler vi slet ikke gider at lede i (for at undgå falske positive i ren metadata)
+    const skipKeys = [
+        'metadata', 'description', 'titleFormatted'
     ];
 
     function traverse(item, keyName = null) {
-        // Afbryd søgningen tidligt, hvis vi rammer en beskyttet nøgle (undgår falske positive i hele grene)
-        if (protectedKeys.includes(keyName)) {
+        // Spring metadata og beskrivelser helt over i søgningen
+        if (skipKeys.includes(keyName)) {
             return item;
         }
 
         if (typeof item === 'string') {
-            if (searchRegex.test(item)) {
+            // Vi tillader kun REPLACE, hvis det IKKE er en system-nøgle
+            const canReplace = performReplace && !noReplaceKeys.includes(keyName);
+            const { hasMatch: stringMatch, resultText } = searchAndReplaceWithBoundaries(item, searchStr, replacementStr, canReplace);
+            if (stringMatch) {
                 hasMatch = true;
-                if (performReplace) {
-                    return item.replace(replaceRegex, replacementStr);
-                }
+                return resultText;
             }
             return item;
         } else if (Array.isArray(item)) {
-            if (performReplace) {
-                return item.map(el => traverse(el, keyName)); // Sender keyName videre ned
-            } else {
-                item.forEach(el => traverse(el, keyName));
-                return item;
+            for (let i = 0; i < item.length; i++) {
+                const traversedEl = traverse(item[i], keyName);
+                if (performReplace && traversedEl !== item[i]) {
+                    item[i] = traversedEl;
+                }
             }
+            return item;
         } else if (item !== null && typeof item === 'object') {
-            if (performReplace) {
-                const newObj = {};
-                for (const key in item) {
-                    // KUN værdier opdateres, nøgler (keys) holdes intakte!
-                    newObj[key] = traverse(item[key], key); // Giver den aktuelle nøgle (key) med
+            for (const key in item) {
+                const traversedVal = traverse(item[key], key);
+                if (performReplace && traversedVal !== item[key]) {
+                    item[key] = traversedVal;
                 }
-                return newObj;
-            } else {
-                for (const key in item) {
-                    traverse(item[key], key);
-                }
-                return item;
             }
+            return item;
         }
         return item;
     }
@@ -137,107 +176,136 @@ async function findVariableUsage() {
     }
 
     // Hent alt data parallelt og sikkert (fanger evt. fejl, hvis et API ikke er tilgængeligt)
-    const [allFlows, allAdvancedFlows, allFolders, allScripts, allLogicVars, allTokens] = await Promise.all([
+    const [allFlows, allAdvancedFlows, allFolders, allAdvFolders, allScripts, allLogicVars, allTokens] = await Promise.all([
         withTimeout(Homey.flow.getFlows(), API_TIMEOUT_MS, 'getFlows').catch(() => ({})),
         withTimeout(Homey.flow.getAdvancedFlows(), API_TIMEOUT_MS, 'getAdvancedFlows').catch(() => ({})),
         (typeof Homey.flow.getFolders === 'function') ? withTimeout(Homey.flow.getFolders(), API_TIMEOUT_MS, 'getFolders').catch(() => ({})) : Promise.resolve({}),
+        (typeof Homey.flow.getAdvancedFlowFolders === 'function') ? withTimeout(Homey.flow.getAdvancedFlowFolders(), API_TIMEOUT_MS, 'getAdvancedFlowFolders').catch(() => ({})) : Promise.resolve({}),
         (Homey.script && typeof Homey.script.getScripts === 'function') ? withTimeout(Homey.script.getScripts(), API_TIMEOUT_MS, 'getScripts').catch(() => ({})) : Promise.resolve({}),
         (Homey.logic && typeof Homey.logic.getVariables === 'function') ? withTimeout(Homey.logic.getVariables(), API_TIMEOUT_MS, 'getVariables').catch(() => ({})) : Promise.resolve({}),
         (Homey.flow && typeof Homey.flow.getTokens === 'function') ? withTimeout(Homey.flow.getTokens(), API_TIMEOUT_MS, 'getTokens').catch(() => ({})) : Promise.resolve({})
     ]);
 
+    const mergedFolders = { ...allFolders, ...allAdvFolders };
+
     let findings = [];
     
-    const escapedVariable = escapeRegExp(variableToFind);
-    
-    // Lookbehinds/Lookaheads bruges i stedet for \b, da det også understøtter specialtegn som parenteser i starten/slutningen af navnet
-    const searchRegex = new RegExp('(?<!\\w)' + escapedVariable + '(?!\\w)', 'i');
-    const replaceRegex = new RegExp('(?<!\\w)' + escapedVariable + '(?!\\w)', 'gi');
-
     console.log(`🔍 Starter i [${ACTION}] tilstand for variablen: "${variableToFind}"...\n`);
 
-    // Hjælpefunktion til at forhindre at Homey overbelastes ved mange opdateringer (throttling)
-    async function throttleUpdate() {
-        if (typeof wait === 'function') {
-            await wait(50);
-        } else {
-            await new Promise(resolve => setTimeout(resolve, 50));
+    // Hjælpefunktion til at afvikle opdateringer i batches for maksimal performance
+    async function runInBatches(tasks, batchSize = 10) {
+        for (let i = 0; i < tasks.length; i += batchSize) {
+            const batch = tasks.slice(i, i + batchSize);
+            await Promise.all(batch.map(task => task()));
+            // Kort pause mellem batches, så Homey kan nå at trække vejret
+            if (i + batchSize < tasks.length) {
+                if (typeof wait === 'function') await wait(50);
+                else await new Promise(resolve => setTimeout(resolve, 50));
+            }
         }
     }
 
+    // Hjælpefunktion til at slå mappenavne op sikkert
+    function getFolderName(folderId, foldersObj) {
+        if (!folderId) return 'Ingen mappe';
+        
+        if (foldersObj[folderId]) {
+            const f = foldersObj[folderId];
+            if (f.title || f.name) return f.title || f.name;
+        }
+        
+        for (const f of Object.values(foldersObj)) {
+            if (f.id === folderId && (f.title || f.name)) {
+                return f.title || f.name;
+            }
+        }
+        return `ID: ${folderId}`;
+    }
+
     // Gennemgå standard flows
+    const flowTasks = [];
     for (const flow of Object.values(allFlows)) {
-        const { hasMatch, resultObj: parsedFlow } = deepSearchAndReplace(flow, searchRegex, replaceRegex, newVariableName, ACTION === 'REPLACE');
+        const { hasMatch, resultObj: parsedFlow } = deepSearchAndReplace(flow, variableToFind, newVariableName, ACTION === 'REPLACE');
         
         if (hasMatch) {
-            const folderName = flow.folder ? (allFolders[flow.folder]?.name ?? `ID: ${flow.folder}`) : 'Ingen mappe';
+            const folderName = getFolderName(flow.folder, mergedFolders);
             findings.push({ Type: 'Standard Flow', Navn: flow.name, Mappe: folderName });
 
             if (ACTION === 'REPLACE') {
                 if (dryRun) {
                     console.log(`   -> 🧪 [DRY RUN] Ville auto-opdatere flow: "${flow.name}"`);
                 } else {
-                    try {
-                        await Homey.flow.updateFlow({ id: flow.id, flow: parsedFlow });
-                        console.log(`   -> 🔄 Auto-opdaterede flow: "${flow.name}"`);
-                        await throttleUpdate();
-                    } catch (err) {
-                        console.error(`   -> ❌ Fejl ved opdatering (JSON/API) for flow "${flow.name}": ${err.message}`);
-                    }
+                    flowTasks.push(async () => {
+                        try {
+                            await Homey.flow.updateFlow({ id: flow.id, flow: parsedFlow });
+                            console.log(`   -> 🔄 Auto-opdaterede flow: "${flow.name}"`);
+                        } catch (err) {
+                            console.error(`   -> ❌ Fejl ved opdatering (JSON/API) for flow "${flow.name}": ${err.message}`);
+                        }
+                    });
                 }
             }
         }
     }
+    if (flowTasks.length > 0) await runInBatches(flowTasks, 10);
 
     // Gennemgå Advanced Flows
+    const advFlowTasks = [];
     for (const advFlow of Object.values(allAdvancedFlows)) {
-        const { hasMatch, resultObj: parsedAdvFlow } = deepSearchAndReplace(advFlow, searchRegex, replaceRegex, newVariableName, ACTION === 'REPLACE');
+        const { hasMatch, resultObj: parsedAdvFlow } = deepSearchAndReplace(advFlow, variableToFind, newVariableName, ACTION === 'REPLACE');
         
         if (hasMatch) {
-            const folderName = advFlow.folder ? (allFolders[advFlow.folder]?.name ?? `ID: ${advFlow.folder}`) : 'Ingen mappe';
+            const folderName = getFolderName(advFlow.folder, mergedFolders);
             findings.push({ Type: 'Advanced Flow', Navn: advFlow.name, Mappe: folderName });
 
             if (ACTION === 'REPLACE') {
                 if (dryRun) {
                     console.log(`   -> 🧪 [DRY RUN] Ville auto-opdatere advanced flow: "${advFlow.name}"`);
                 } else {
-                    try {
-                        await Homey.flow.updateAdvancedFlow({ id: advFlow.id, advancedFlow: parsedAdvFlow });
-                        console.log(`   -> 🔄 Auto-opdaterede advanced flow: "${advFlow.name}"`);
-                        await throttleUpdate();
-                    } catch (err) {
-                        console.error(`   -> ❌ Fejl ved opdatering (JSON/API) for advanced flow "${advFlow.name}": ${err.message}`);
-                    }
+                    advFlowTasks.push(async () => {
+                        try {
+                            await Homey.flow.updateAdvancedFlow({ id: advFlow.id, advancedFlow: parsedAdvFlow });
+                            console.log(`   -> 🔄 Auto-opdaterede advanced flow: "${advFlow.name}"`);
+                        } catch (err) {
+                            console.error(`   -> ❌ Fejl ved opdatering (JSON/API) for advanced flow "${advFlow.name}": ${err.message}`);
+                        }
+                    });
                 }
             }
         }
     }
+    if (advFlowTasks.length > 0) await runInBatches(advFlowTasks, 10);
 
     // Gennemgå HomeyScripts
+    const scriptTasks = [];
     for (const script of Object.values(allScripts)) {
-        if (script.code && searchRegex.test(script.code)) {
-            findings.push({ Type: 'HomeyScript', Navn: script.name, Mappe: 'Scripts' });
+        if (script.code) {
+            const { hasMatch, resultText: updatedCode } = searchAndReplaceWithBoundaries(script.code, variableToFind, newVariableName, ACTION === 'REPLACE');
+            if (hasMatch) {
+                findings.push({ Type: 'HomeyScript', Navn: script.name, Mappe: 'Scripts' });
 
-            if (ACTION === 'REPLACE') {
-                const updatedCode = script.code.replace(replaceRegex, newVariableName);
-                if (dryRun) {
-                    console.log(`   -> 🧪 [DRY RUN] Ville auto-opdatere HomeyScript: "${script.name}"`);
-                } else {
-                    try {
-                        // Vi kopierer det eksisterende script-objekt og overskriver kun koden
-                        const updatedScriptObj = { ...script, code: updatedCode };
-                        await Homey.script.updateScript({ id: script.id, script: updatedScriptObj });
-                        console.log(`   -> 🔄 Auto-opdaterede HomeyScript: "${script.name}"`);
-                        await throttleUpdate();
-                    } catch (err) {
-                        console.error(`   -> ❌ Fejl ved opdatering af HomeyScript: ${err.message}`);
+                if (ACTION === 'REPLACE') {
+                    if (dryRun) {
+                        console.log(`   -> 🧪 [DRY RUN] Ville auto-opdatere HomeyScript: "${script.name}"`);
+                    } else {
+                        scriptTasks.push(async () => {
+                            try {
+                                const updatedScriptObj = { ...script, code: updatedCode };
+                                await Homey.script.updateScript({ id: script.id, script: updatedScriptObj });
+                                console.log(`   -> 🔄 Auto-opdaterede HomeyScript: "${script.name}"`);
+                            } catch (err) {
+                                console.error(`   -> ❌ Fejl ved opdatering af HomeyScript: ${err.message}`);
+                            }
+                        });
                     }
                 }
             }
         }
     }
+    if (scriptTasks.length > 0) await runInBatches(scriptTasks, 10);
 
     // Gennemgå Homey Logic Variabler
+    const logicVarTasks = [];
     for (const logicVar of Object.values(allLogicVars)) {
         // For variabler tjekker vi det præcise navn (ignorerer dog store/små bogstaver)
         if (logicVar.name.toLowerCase() === variableToFind.toLowerCase()) {
@@ -247,19 +315,23 @@ async function findVariableUsage() {
                 if (dryRun) {
                     console.log(`   -> 🧪 [DRY RUN] Ville auto-omdøbe Logic variabel: "${logicVar.name}" til "${newVariableName}"`);
                 } else {
-                    try {
-                        await Homey.logic.updateVariable({ id: logicVar.id, variable: { name: newVariableName } });
-                        console.log(`   -> 🔄 Auto-omdøbte Logic variabel: "${logicVar.name}" til "${newVariableName}"`);
-                        await throttleUpdate();
-                    } catch (err) {
-                        console.error(`   -> ❌ Fejl ved omdøbning af Logic variabel: ${err.message}`);
-                    }
+                    logicVarTasks.push(async () => {
+                        try {
+                            await Homey.logic.updateVariable({ id: logicVar.id, variable: { name: newVariableName } });
+                            console.log(`   -> 🔄 Auto-omdøbte Logic variabel: "${logicVar.name}" til "${newVariableName}"`);
+                        } catch (err) {
+                            console.error(`   -> ❌ Fejl ved omdøbning af Logic variabel: ${err.message}`);
+                        }
+                    });
                 }
             }
         }
     }
+    if (logicVarTasks.length > 0) await runInBatches(logicVarTasks, 10);
 
     // Gennemgå Indbyggede Tags (Tokens)
+    // Bemærk: Homey tokens (tags) genereres ofte dynamisk af apps (runtime-only) og kan sjældent omdøbes via API.
+    // Scriptet finder tekst-referencerne i dine flows, men kilde-tagget må rettes manuelt i den respektive app.
     for (const token of Object.values(allTokens)) {
         const tokenName = token.title || token.name || '';
         if (tokenName.toLowerCase() === variableToFind.toLowerCase()) {
