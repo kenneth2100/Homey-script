@@ -39,6 +39,9 @@ const SILENT_MODE = false;
 // Sæt til true for at se tekniske detaljer i konsollen (bruges til fejlfinding)
 const DEBUG_MODE = false;
 
+// Timeout for API-kald i millisekunder (f.eks. 15000 = 15 sekunder)
+const API_TIMEOUT_MS = 15000;
+
 async function findBrokenCards() {
     function log(...args) {
         if (!SILENT_MODE) console.log(...args);
@@ -48,17 +51,45 @@ async function findBrokenCards() {
         if (DEBUG_MODE) console.log('🐞', ...args);
     }
 
+    // Funktion til at indkapsle asynkrone API-kald med en timeout (HomeyScript-sikker)
+    function withTimeout(promise, ms, name) {
+        if (typeof setTimeout === 'function' && typeof clearTimeout === 'function') {
+            return new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    log(`⏳ TIMEOUT: API-kald '${name}' timede ud efter ${ms}ms.`);
+                    reject(new Error(`Timeout: ${name}`));
+                }, ms);
+                promise.then(res => { clearTimeout(timer); resolve(res); })
+                       .catch(err => { clearTimeout(timer); reject(err); });
+            });
+        } else if (typeof wait === 'function') {
+            let isResolved = false;
+            const wrappedPromise = promise.then(
+                res => { isResolved = true; return res; },
+                err => { isResolved = true; throw err; }
+            );
+            const timeoutPromise = wait(ms).then(() => {
+                if (!isResolved) {
+                    log(`⏳ TIMEOUT: API-kald '${name}' timede ud efter ${ms}ms.`);
+                    throw new Error(`Timeout: ${name}`);
+                }
+            });
+            return Promise.race([wrappedPromise, timeoutPromise]);
+        }
+        return promise;
+    }
+
     log("🔍 Starter dybdegående søgning efter ødelagte flows...\n");
 
     // 1. Hent alt systemdata parallelt for lynhurtig indlæsning
     const [devices, appsList, logicVars, zones, users, flows, advancedFlows] = await Promise.all([
-        Homey.devices.getDevices().catch(() => ({})),
-        Homey.apps.getApps().catch(() => ({})),
-        Homey.logic.getVariables().catch(() => ({})),
-        Homey.zones.getZones().catch(() => ({})),
-        Homey.users.getUsers().catch(() => ({})),
-        Homey.flow.getFlows().catch(() => ({})),
-        Homey.flow.getAdvancedFlows().catch(() => ({}))
+        withTimeout(Homey.devices.getDevices(), API_TIMEOUT_MS, "Enheder").catch(() => ({})),
+        withTimeout(Homey.apps.getApps(), API_TIMEOUT_MS, "Apps").catch(() => ({})),
+        withTimeout(Homey.logic.getVariables(), API_TIMEOUT_MS, "Variabler").catch(() => ({})),
+        withTimeout(Homey.zones.getZones(), API_TIMEOUT_MS, "Zoner").catch(() => ({})),
+        withTimeout(Homey.users.getUsers(), API_TIMEOUT_MS, "Brugere").catch(() => ({})),
+        withTimeout(Homey.flow.getFlows(), API_TIMEOUT_MS, "Standard Flows").catch(() => ({})),
+        withTimeout(Homey.flow.getAdvancedFlows(), API_TIMEOUT_MS, "Advanced Flows").catch(() => ({}))
     ]);
 
     const validDeviceIds = new Set(Object.keys(devices));
@@ -79,10 +110,10 @@ async function findBrokenCards() {
     let foundExtendedTokens = false;
 
     const tokenDiscoveryMethods = [
-        async () => Homey.flowToken && (await Homey.flowToken.getFlowTokens()).map(t => t.id),
-        async () => Homey.flowToken && (await Homey.flowToken.getTokens()).map(t => t.id),
-        async () => Homey.flow && Object.keys(await Homey.flow.getTokens()),
-        async () => Homey.flow && (await Homey.flow.getFlowTokens()).map(t => t.id)
+        async () => Homey.flowToken && (await withTimeout(Homey.flowToken.getFlowTokens(), API_TIMEOUT_MS, "FlowTokens")).map(t => t.id),
+        async () => Homey.flowToken && (await withTimeout(Homey.flowToken.getTokens(), API_TIMEOUT_MS, "Tokens")).map(t => t.id),
+        async () => Homey.flow && Object.keys(await withTimeout(Homey.flow.getTokens(), API_TIMEOUT_MS, "Flow Tokens (Legacy)")),
+        async () => Homey.flow && (await withTimeout(Homey.flow.getFlowTokens(), API_TIMEOUT_MS, "FlowTokens (Legacy)")).map(t => t.id)
     ];
 
     for (const method of tokenDiscoveryMethods) {
@@ -385,12 +416,11 @@ async function findBrokenCards() {
         log("--------------------------------------------------\n");
     }
 
-    const currentVars = await Homey.logic.getVariables();
-    let targetVar = Object.values(currentVars).find(v => v.name === BROKEN_FLOWS_VAR_NAME);
+    let targetVar = Object.values(logicVars).find(v => v.name === BROKEN_FLOWS_VAR_NAME);
 
     if (!targetVar) {
         try {
-            targetVar = await Homey.logic.createVariable({ name: BROKEN_FLOWS_VAR_NAME, type: 'string' });
+            targetVar = await withTimeout(Homey.logic.createVariable({ name: BROKEN_FLOWS_VAR_NAME, type: 'string' }), API_TIMEOUT_MS, "Opret Variabel");
             log(`✅ Oprettede ny variabel: '${BROKEN_FLOWS_VAR_NAME}'`);
         } catch (err) {
             console.error(`❌ Fejl ved oprettelse af variabel: ${err.message}`);
@@ -459,8 +489,12 @@ async function findBrokenCards() {
             newValue = newValue.substring(0, 3500) + "\n... (listen er afkortet pga. længde)";
         }
 
-        await Homey.logic.updateVariable({ id: targetVar.id, variable: { value: newValue } });
-        log(`✅ Opdaterede variablen '${BROKEN_FLOWS_VAR_NAME}' med listen over fejl.`);
+        try {
+            await withTimeout(Homey.logic.updateVariable({ id: targetVar.id, variable: { value: newValue } }), API_TIMEOUT_MS, "Opdater Variabel");
+            log(`✅ Opdaterede variablen '${BROKEN_FLOWS_VAR_NAME}' med listen over fejl.`);
+        } catch (err) {
+            console.error(`❌ Fejl ved opdatering af variabel: ${err.message}`);
+        }
     }
 
     // Returner true hvis der er fejl, så flowet kan reagere (OG...)
