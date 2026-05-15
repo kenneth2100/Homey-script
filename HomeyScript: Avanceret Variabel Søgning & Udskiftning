@@ -20,9 +20,94 @@ const variableToFind = 'nat lys';
 const newVariableName = 'nyt lys'; // Det nye variabelnavn (kun relevant hvis ACTION = 'REPLACE')
 const dryRun = true; // Sæt til false for at udføre faktiske ændringer ved 'REPLACE'!
 
+// Timeout for API-kald i millisekunder
+const API_TIMEOUT_MS = 15000;
+
+// Funktion til at indkapsle asynkrone API-kald med en timeout for at forhindre script-hang
+function withTimeout(promise, ms, name) {
+    if (typeof setTimeout === 'function' && typeof clearTimeout === 'function') {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                console.error(`⏳ TIMEOUT: API-kald '${name}' timede ud efter ${ms}ms.`);
+                reject(new Error(`Timeout: ${name}`));
+            }, ms);
+            promise.then(res => { clearTimeout(timer); resolve(res); })
+                   .catch(err => { clearTimeout(timer); reject(err); });
+        });
+    } else if (typeof wait === 'function') {
+        let isResolved = false;
+        const wrappedPromise = promise.then(
+            res => { isResolved = true; return res; },
+            err => { isResolved = true; throw err; }
+        );
+        const timeoutPromise = wait(ms).then(() => {
+            if (!isResolved) {
+                console.error(`⏳ TIMEOUT: API-kald '${name}' timede ud efter ${ms}ms.`);
+                throw new Error(`Timeout: ${name}`);
+            }
+        });
+        return Promise.race([wrappedPromise, timeoutPromise]);
+    }
+    return promise;
+}
+
 // Hjælpefunktion til at "escape" specialtegn i tekst, så de ikke ødelægger vores RegExp
 function escapeRegExp(string) {
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& betyder hele det matchede tegn
+}
+
+// Hjælpefunktion til dyb søgning og sikker udskiftning af string-værdier (beskytter JSON-nøgler)
+function deepSearchAndReplace(obj, searchRegex, replaceRegex, replacementStr, performReplace) {
+    let hasMatch = false;
+
+    // Nøgler vi ALDRIG må ændre indholdet af, da de udgør flowets metadata og fundamentale struktur
+    const protectedKeys = [
+        'id', 'uri', 'ownerUri', 'type', 'token', 'droptokens', 'folder',
+        'name', 'title', 'titleFormatted', 'description', 'createdAt',
+        'modifiedAt', 'icon', 'color', 'metadata', 'version'
+    ];
+
+    function traverse(item, keyName = null) {
+        // Afbryd søgningen tidligt, hvis vi rammer en beskyttet nøgle (undgår falske positive i hele grene)
+        if (protectedKeys.includes(keyName)) {
+            return item;
+        }
+
+        if (typeof item === 'string') {
+            if (searchRegex.test(item)) {
+                hasMatch = true;
+                if (performReplace) {
+                    return item.replace(replaceRegex, replacementStr);
+                }
+            }
+            return item;
+        } else if (Array.isArray(item)) {
+            if (performReplace) {
+                return item.map(el => traverse(el, keyName)); // Sender keyName videre ned
+            } else {
+                item.forEach(el => traverse(el, keyName));
+                return item;
+            }
+        } else if (item !== null && typeof item === 'object') {
+            if (performReplace) {
+                const newObj = {};
+                for (const key in item) {
+                    // KUN værdier opdateres, nøgler (keys) holdes intakte!
+                    newObj[key] = traverse(item[key], key); // Giver den aktuelle nøgle (key) med
+                }
+                return newObj;
+            } else {
+                for (const key in item) {
+                    traverse(item[key], key);
+                }
+                return item;
+            }
+        }
+        return item;
+    }
+
+    const resultObj = traverse(obj);
+    return { hasMatch, resultObj };
 }
 
 async function findVariableUsage() {
@@ -53,12 +138,12 @@ async function findVariableUsage() {
 
     // Hent alt data parallelt og sikkert (fanger evt. fejl, hvis et API ikke er tilgængeligt)
     const [allFlows, allAdvancedFlows, allFolders, allScripts, allLogicVars, allTokens] = await Promise.all([
-        Homey.flow.getFlows().catch(() => ({})),
-        Homey.flow.getAdvancedFlows().catch(() => ({})),
-        (typeof Homey.flow.getFolders === 'function') ? Homey.flow.getFolders().catch(() => ({})) : Promise.resolve({}),
-        (Homey.script && typeof Homey.script.getScripts === 'function') ? Homey.script.getScripts().catch(() => ({})) : Promise.resolve({}),
-        (Homey.logic && typeof Homey.logic.getVariables === 'function') ? Homey.logic.getVariables().catch(() => ({})) : Promise.resolve({}),
-        (Homey.flow && typeof Homey.flow.getTokens === 'function') ? Homey.flow.getTokens().catch(() => ({})) : Promise.resolve({})
+        withTimeout(Homey.flow.getFlows(), API_TIMEOUT_MS, 'getFlows').catch(() => ({})),
+        withTimeout(Homey.flow.getAdvancedFlows(), API_TIMEOUT_MS, 'getAdvancedFlows').catch(() => ({})),
+        (typeof Homey.flow.getFolders === 'function') ? withTimeout(Homey.flow.getFolders(), API_TIMEOUT_MS, 'getFolders').catch(() => ({})) : Promise.resolve({}),
+        (Homey.script && typeof Homey.script.getScripts === 'function') ? withTimeout(Homey.script.getScripts(), API_TIMEOUT_MS, 'getScripts').catch(() => ({})) : Promise.resolve({}),
+        (Homey.logic && typeof Homey.logic.getVariables === 'function') ? withTimeout(Homey.logic.getVariables(), API_TIMEOUT_MS, 'getVariables').catch(() => ({})) : Promise.resolve({}),
+        (Homey.flow && typeof Homey.flow.getTokens === 'function') ? withTimeout(Homey.flow.getTokens(), API_TIMEOUT_MS, 'getTokens').catch(() => ({})) : Promise.resolve({})
     ]);
 
     let findings = [];
@@ -71,22 +156,31 @@ async function findVariableUsage() {
 
     console.log(`🔍 Starter i [${ACTION}] tilstand for variablen: "${variableToFind}"...\n`);
 
+    // Hjælpefunktion til at forhindre at Homey overbelastes ved mange opdateringer (throttling)
+    async function throttleUpdate() {
+        if (typeof wait === 'function') {
+            await wait(50);
+        } else {
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+    }
+
     // Gennemgå standard flows
     for (const flow of Object.values(allFlows)) {
-        const flowString = JSON.stringify(flow);
-        if (searchRegex.test(flowString)) {
+        const { hasMatch, resultObj: parsedFlow } = deepSearchAndReplace(flow, searchRegex, replaceRegex, newVariableName, ACTION === 'REPLACE');
+        
+        if (hasMatch) {
             const folderName = flow.folder ? (allFolders[flow.folder]?.name ?? `ID: ${flow.folder}`) : 'Ingen mappe';
             findings.push({ Type: 'Standard Flow', Navn: flow.name, Mappe: folderName });
 
             if (ACTION === 'REPLACE') {
-                const updatedFlowString = flowString.replace(replaceRegex, newVariableName);
                 if (dryRun) {
                     console.log(`   -> 🧪 [DRY RUN] Ville auto-opdatere flow: "${flow.name}"`);
                 } else {
                     try {
-                        const parsedFlow = JSON.parse(updatedFlowString);
                         await Homey.flow.updateFlow({ id: flow.id, flow: parsedFlow });
                         console.log(`   -> 🔄 Auto-opdaterede flow: "${flow.name}"`);
+                        await throttleUpdate();
                     } catch (err) {
                         console.error(`   -> ❌ Fejl ved opdatering (JSON/API) for flow "${flow.name}": ${err.message}`);
                     }
@@ -97,20 +191,20 @@ async function findVariableUsage() {
 
     // Gennemgå Advanced Flows
     for (const advFlow of Object.values(allAdvancedFlows)) {
-        const advFlowString = JSON.stringify(advFlow);
-        if (searchRegex.test(advFlowString)) {
+        const { hasMatch, resultObj: parsedAdvFlow } = deepSearchAndReplace(advFlow, searchRegex, replaceRegex, newVariableName, ACTION === 'REPLACE');
+        
+        if (hasMatch) {
             const folderName = advFlow.folder ? (allFolders[advFlow.folder]?.name ?? `ID: ${advFlow.folder}`) : 'Ingen mappe';
             findings.push({ Type: 'Advanced Flow', Navn: advFlow.name, Mappe: folderName });
 
             if (ACTION === 'REPLACE') {
-                const updatedAdvFlowString = advFlowString.replace(replaceRegex, newVariableName);
                 if (dryRun) {
                     console.log(`   -> 🧪 [DRY RUN] Ville auto-opdatere advanced flow: "${advFlow.name}"`);
                 } else {
                     try {
-                        const parsedAdvFlow = JSON.parse(updatedAdvFlowString);
                         await Homey.flow.updateAdvancedFlow({ id: advFlow.id, advancedFlow: parsedAdvFlow });
                         console.log(`   -> 🔄 Auto-opdaterede advanced flow: "${advFlow.name}"`);
+                        await throttleUpdate();
                     } catch (err) {
                         console.error(`   -> ❌ Fejl ved opdatering (JSON/API) for advanced flow "${advFlow.name}": ${err.message}`);
                     }
@@ -134,6 +228,7 @@ async function findVariableUsage() {
                         const updatedScriptObj = { ...script, code: updatedCode };
                         await Homey.script.updateScript({ id: script.id, script: updatedScriptObj });
                         console.log(`   -> 🔄 Auto-opdaterede HomeyScript: "${script.name}"`);
+                        await throttleUpdate();
                     } catch (err) {
                         console.error(`   -> ❌ Fejl ved opdatering af HomeyScript: ${err.message}`);
                     }
@@ -155,6 +250,7 @@ async function findVariableUsage() {
                     try {
                         await Homey.logic.updateVariable({ id: logicVar.id, variable: { name: newVariableName } });
                         console.log(`   -> 🔄 Auto-omdøbte Logic variabel: "${logicVar.name}" til "${newVariableName}"`);
+                        await throttleUpdate();
                     } catch (err) {
                         console.error(`   -> ❌ Fejl ved omdøbning af Logic variabel: ${err.message}`);
                     }
