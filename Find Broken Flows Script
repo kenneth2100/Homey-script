@@ -359,8 +359,21 @@ async function findBrokenCards() {
         log(''); // Tilføj et linjeskift for læsbarhed
     }
 
+    // --- Batch Delay Helper ---
+    // Frigiver CPU'en i 100ms for hver 10 flows der behandles, så vi ikke låser Homey
+    let processedFlowsCount = 0;
+    async function applyBatchDelay() {
+        processedFlowsCount++;
+        if (processedFlowsCount % 10 === 0) {
+            if (typeof wait === 'function') await wait(100);
+            else await new Promise(r => setTimeout(r, 100));
+        }
+    }
+
     // 3. Tjek Standard Flows
     for (const flow of Object.values(flows)) {
+        await applyBatchDelay();
+
         // Spring over flows, der er på ignoreringslisten
         if (IGNORE_FLOWS.includes(flow.name)) {
             debug(`Springer over ignoreret flow: "${flow.name}"`);
@@ -385,6 +398,8 @@ async function findBrokenCards() {
 
     // 4. Tjek Advanced Flows
     for (const flow of Object.values(advancedFlows)) {
+        await applyBatchDelay();
+
         // Spring over flows, der er på ignoreringslisten
         if (IGNORE_FLOWS.includes(flow.name)) {
             debug(`Springer over ignoreret Advanced Flow: "${flow.name}"`);
