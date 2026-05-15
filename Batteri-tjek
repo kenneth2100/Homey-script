@@ -10,15 +10,18 @@
 // Det overvåger proaktivt sundheden af alle dine batteridrevne enheder og sensorer.
 //
 // NØGLEFUNKTIONER:
-// 1. INGEN SPAM (State-håndtering): Scriptet husker tidligere advarsler. Du får kun 
-//    besked, når et problem er NYT, eller når problemet endelig er løst.
-// 2. 'SUDDEN DROP' DETEKTION: Fanger enheder (ofte Zigbee), der pludselig dør eller 
-//    falder drastisk, selvom de for nylig rapporterede et højt batteriniveau.
-// 3. DETEKTION AF INAKTIVITET (DØDE ENHEDER): Overvåger sikkerhedssensorer og advarer, 
-//    hvis de i stilhed er stoppet med at kommunikere med din Homey.
-// 4. PÅMINDELSER: Sender en venlig reminder, hvis et problem har været uløst i X dage.
-// 5. AUTOMATISK KUITTERING: Registrerer selv, når du har skiftet batteriet eller 
-//    vækket enheden, og sender dig en grøn "løst"-kvittering.
+// 1. INGEN SPAM (State): Husker tidligere advarsler. Du får kun besked, når et problem 
+//    er NYT, eller når problemet endelig er løst.
+// 2. 'DEBOUNCE' / FEJLFILTRERING: Filtrerer falske hardware-udfald (f.eks. Zigbee der 
+//    melder 0% et øjeblik) ved at kræve bekræftelse over flere kørsler (lowCount).
+// 3. 'SUDDEN DROP' DETEKTION: Fanger enheder der pludselig dør eller falder drastisk, 
+//    selvom de for nylig rapporterede et højt batteriniveau.
+// 4. MÅLRETTET INAKTIVITET (DØDE ENHEDER): Overvåger specifikke enhedsklasser (sensorer, 
+//    m.m.) og advarer, hvis de i stilhed er stoppet med at kommunikere med Homey.
+// 5. PÅMINDELSER & KUITTERINGER: Sender en reminder ved uløste problemer og en grøn 
+//    "løst"-kvittering, når batteriet er skiftet og enheden er online igen.
+// 6. ENTERPRISE ROBUSTHED: Indbygget beskyttelse mod API-timeouts, unikt token-baseret 
+//    låsesystem mod race-conditions, og automatisk oprydning af gammel data (state-bloat).
 //
 // Scriptet er "Plug & Play" og opretter automatisk de nødvendige logik-variabler 
 // for at opretholde state og forhindre konflikter ved samtidige kørsler.
@@ -33,11 +36,13 @@
 // - Tilføjet understøttelse af enheder der kun har 'alarm_battery' (ingen procent).
 // - Rettet visning af rumnavne (zone lookup).
 // - Tilføjet opsummering af ignorerede enheder i loggen.
-// - Tilføjet tjek for inaktive enheder (døde enheder der ikke opdaterer).
+// - Forbedret inaktivitets-tjek, så der filtreres skarpt på specifikke enhedsklasser.
 // - Tilføjet mulighed for at ekskludere specifikke enheder KUN fra inaktivitets-tjekket.
+// - **NYT**: Tilføjet Debounce-logik mod falske drops og NaN-værdier fra sensorer.
+// - **NYT**: Tilføjet API timeout-beskyttelse (`withTimeout`) så scriptet aldrig hænger.
 // - **ROBUSTHED**: Bruger nu enheds-ID i stedet for navn til state-håndtering.
-// - **ROBUSTHED**: Tilføjet try/catch omkring Homey API-kald for at undgå script-crash.
-// - **ROBUSTHED**: Implementeret en låsemekanisme for at forhindre samtidige kørsler (race conditions).
+// - **ROBUSTHED**: Unikt token (`myLockToken`) implementeret for skudsikker proces-låsning.
+// - **ROBUSTHED**: Indført selvrensende "state-bloat" mekanisme i JSON-objektet.
 // - **FIX**: Rettet "sudden drop"-detektion for batteriniveauer der er 0.
 // - **FIX**: Bruger JSON.parse/stringify i stedet for structuredClone (understøttes ikke i HomeyScript).
 
@@ -54,6 +59,7 @@ const CONFIG = {
 
   CHECK_INACTIVITY: true,                   // Tjek om enheder er stoppet med at opdatere (døde enheder)
   MAX_INACTIVITY_HOURS: 168,                // Timer uden opdatering før enhed anses for inaktiv (168 = 7 dage)
+  INACTIVITY_CLASSES: ['sensor', 'motion', 'contactsensor', 'smokesensor', 'water'], // Enhedsklasser der overvåges for inaktivitet
   // Enheder der sjældent rapporterer (f.eks. dørkontakt på gæsteværelse) kan ekskluderes fra inaktivitetstjek.
   EXCLUDE_INACTIVITY_DEVICES: [],           // Ignorer disse enheder KUN for inaktivitets-tjek, f.eks. ['Postkasse Sensor']
   
@@ -74,9 +80,20 @@ const CONFIG = {
   LOCK_VARIABLE_NAME: 'BatteryMonitorLock',
   LOCK_TIMEOUT_MS: 30000,                   // 30 sekunder før en lås anses for forældet.
   MAX_MESSAGE_LENGTH: 8000,                 // Max længde for push-beskeder for at undgå trunkering.
+  API_TIMEOUT_MS: 10000,                    // 10 sekunders timeout på API-kald for at undgå script-hang.
 };
 
 // --- Start af script ---
+
+// Funktion til at indkapsle asynkrone kald med en timeout
+function withTimeout(promise, ms, errorMessage) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(errorMessage || `Timeout efter ${ms}ms`)), ms)
+    )
+  ]);
+}
 
 // Funktion til at parse state. Håndterer nu kun det nye ID-baserede JSON-format.
 // Nulstiller state hvis det gamle format detekteres, for at sikre en ren overgang.
@@ -147,13 +164,15 @@ async function getOrCreateVariable(name, type, defaultValue) {
 let deviceStates = {};
 let alertedDevicesVariable = null;
 let lockVariable = null;
+let myLockToken = null;
 
 // --- Låsemekanisme for at forhindre samtidige kørsler ---
 if (CONFIG.USE_STATE_HANDLING) {
   try {
-    lockVariable = await getOrCreateVariable(CONFIG.LOCK_VARIABLE_NAME, 'boolean', false);
+    lockVariable = await getOrCreateVariable(CONFIG.LOCK_VARIABLE_NAME, 'string', '');
+    myLockToken = `${Date.now()}-${Math.random()}`;
 
-    if (lockVariable.value === true) {
+    if (lockVariable.value !== '') {
       const lastModified = lockVariable.lastUpdated ? new Date(lockVariable.lastUpdated).getTime() : 0;
       if (Date.now() - lastModified < CONFIG.LOCK_TIMEOUT_MS) {
         log('Scriptet kører allerede. Afslutter for at undgå race condition.');
@@ -162,7 +181,7 @@ if (CONFIG.USE_STATE_HANDLING) {
       log('ADVARSEL: Låsevariabel var aktiv, men er udløbet. Overtager låsen.');
     }
     // Sæt lås
-    await Homey.logic.updateVariable({ id: lockVariable.id, variable: { value: true } });
+    await Homey.logic.updateVariable({ id: lockVariable.id, variable: { value: myLockToken } });
     
     // Dobbelt-tjek for at afhjælpe race conditions (Homey mangler atomic operations)
     if (typeof wait === 'function') {
@@ -171,7 +190,7 @@ if (CONFIG.USE_STATE_HANDLING) {
       await new Promise(resolve => setTimeout(resolve, Math.random() * 300 + 200));
     }
     const lockCheck = await Homey.logic.getVariables();
-    if (lockCheck[lockVariable.id] && lockCheck[lockVariable.id].value === false) {
+    if (lockCheck[lockVariable.id] && lockCheck[lockVariable.id].value !== myLockToken) {
       log('Race condition detekteret: En anden instans tog låsen i mellemtiden.');
       return false;
     }
@@ -191,7 +210,7 @@ if (CONFIG.USE_STATE_HANDLING) {
     log(`Fejl: ${e.message}`);
     await safeTagUpdate(CONFIG.ALERT_TAG_NAME, e.message);
     // Frigiv lås før afslutning
-    if (lockVariable) await Homey.logic.updateVariable({ id: lockVariable.id, variable: { value: false } });
+    if (lockVariable) await Homey.logic.updateVariable({ id: lockVariable.id, variable: { value: '' } });
     return false; // Kan ikke fortsætte uden state-variabel
   }
   // Indlæs og parse state fra Homey-variabel
@@ -212,8 +231,12 @@ try {
   // --- Frigiv lås ---
   if (CONFIG.USE_STATE_HANDLING && lockVariable) {
     try {
-      await Homey.logic.updateVariable({ id: lockVariable.id, variable: { value: false } });
-      log('Lås frigivet.');
+      // Tjek om vi stadig ejer låsen, inden vi sletter den
+      const lockCheck = await Homey.logic.getVariables();
+      if (lockCheck[lockVariable.id] && lockCheck[lockVariable.id].value === myLockToken) {
+        await Homey.logic.updateVariable({ id: lockVariable.id, variable: { value: '' } });
+        log('Lås frigivet.');
+      }
     } catch (e) {
       log(`Fejl ved frigivelse af lås: ${e.message}`);
     }
@@ -283,16 +306,51 @@ for (const device of sortedDevices) {
   const batteryLevel = (rawBat !== null && rawBat !== undefined && !isNaN(rawBat)) ? Number(rawBat) : 100;
   const isValidBattery = batteryLevel >= 0 && batteryLevel <= 100;
 
-  // Opdater altid sidst kendte batteriniveau i state, hvis state-håndtering er aktiv.
+  const currentState = deviceStates[deviceId] || {};
+  let currentLowCount = currentState.lowCount || 0;
+  
+  let isBatteryLow = isValidBattery && batteryLevel <= CONFIG.BATTERY_THRESHOLD;
+  let isBatteryCritical = isValidBattery && batteryLevel <= CONFIG.BATTERY_CRITICAL_THRESHOLD;
+  let isSuddenDrop = false;
+
+  // --- Sudden Drop Detection (Forberedelse) ---
+  if (CONFIG.USE_STATE_HANDLING && CONFIG.DETECT_SUDDEN_DROPS && !currentState.alertedAt) {
+    const lastLevel = currentState.lastLevel;
+    if (lastLevel != null && lastLevel > CONFIG.BATTERY_THRESHOLD && isBatteryCritical) {
+      isSuddenDrop = true;
+    }
+  }
+
+  // Inkrementer tæller, hvis der er et muligt batteriproblem
+  if (isBatteryLow || isSuddenDrop) {
+    currentLowCount++;
+  } else {
+    currentLowCount = 0;
+  }
+
+  // Opdater state med debounce-sikring
   if (CONFIG.USE_STATE_HANDLING) {
-      newDeviceStates[deviceId] = { ...newDeviceStates[deviceId], name: deviceName, lastLevel: batteryLevel };
+    newDeviceStates[deviceId] = { ...newDeviceStates[deviceId], name: deviceName, lowCount: currentLowCount };
+    // Frys lastLevel under debounce, så et pludseligt fald stadig kan bekræftes mod den gamle "raske" værdi
+    if (currentLowCount > 0 && currentLowCount < CONFIG.DEBOUNCE_POLLS) {
+      newDeviceStates[deviceId].lastLevel = currentState.lastLevel !== undefined ? currentState.lastLevel : batteryLevel;
+    } else {
+      newDeviceStates[deviceId].lastLevel = batteryLevel;
+    }
+  }
+
+  let debounceActive = false;
+  if (CONFIG.USE_STATE_HANDLING && currentLowCount > 0 && currentLowCount < CONFIG.DEBOUNCE_POLLS) {
+    log(`⏳ Debouncer mulig batterifejl for ${deviceName} (${batteryLevel}%, kørsel ${currentLowCount}/${CONFIG.DEBOUNCE_POLLS})`);
+    debounceActive = true;
   }
 
   // Tjek inaktivitet (om enheden er "død")
   let isInactive = false;
   let inactivityHours = 0;
-  // Filtrer: Tjek inaktivitet på alle sikkerhedssensorer (motion, contact, smoke, water, etc.)
-  const isSecuritySensor = device.capabilitiesObj && Object.keys(device.capabilitiesObj).some(cap => cap.startsWith('alarm_'));
+  // Filtrer: Tjek inaktivitet på udvalgte enhedsklasser frem for bredt på 'alarm_' capabilities
+  const isSecuritySensor = (device.class && CONFIG.INACTIVITY_CLASSES.includes(device.class)) || 
+                           (device.virtualClass && CONFIG.INACTIVITY_CLASSES.includes(device.virtualClass));
   const isExcludedFromInactivity = excludeInactivitySet.has(deviceName);
 
   if (CONFIG.CHECK_INACTIVITY && isSecuritySensor && device.capabilitiesObj && !isExcludedFromInactivity) {
@@ -324,18 +382,12 @@ for (const device of sortedDevices) {
   }
 
   const issueDetails = [];
-  const currentState = deviceStates[deviceId];
   const now = new Date();
 
   // --- Sudden Drop Detection ---
-  // Tjek for pludseligt fald, hvis enheden ikke allerede var i en problemtilstand.
-  if (CONFIG.USE_STATE_HANDLING && CONFIG.DETECT_SUDDEN_DROPS && currentState && !currentState.alertedAt) { 
-    const lastLevel = currentState.lastLevel; // Kan være 0, null eller undefined
-    if (lastLevel != null && lastLevel > CONFIG.BATTERY_THRESHOLD && isValidBattery && batteryLevel <= CONFIG.BATTERY_CRITICAL_THRESHOLD) {
-      issueDetails.unshift(`☠️ Døde pludseligt (fra ${lastLevel}%)`);
-      // Sørg for at dette rapporteres som et problem
-      deviceIssue = true;
-    }
+  if (isSuddenDrop && !debounceActive) { 
+    issueDetails.unshift(`☠️ Døde pludseligt (fra ${currentState.lastLevel}%)`);
+    deviceIssue = true;
   }
 
   // Tilføj inaktivitet til rapporten
@@ -353,8 +405,8 @@ for (const device of sortedDevices) {
     deviceIsCritical = true;
   }
 
-  if (isValidBattery && batteryLevel <= CONFIG.BATTERY_THRESHOLD) {
-    if (batteryLevel <= CONFIG.BATTERY_CRITICAL_THRESHOLD) {
+  if (isBatteryLow && !debounceActive) {
+    if (isBatteryCritical) {
       issueDetails.push(`Kritisk lavt batteri (${batteryLevel}%)`);
       deviceIsCritical = true;
     } else {
@@ -418,11 +470,20 @@ for (const device of sortedDevices) {
   }
 }
   
-// Ryd op i state: Fjern enheder fra variablen, som ikke længere findes, er ekskluderet eller deaktiveret
+// Ryd op i state: Fjern enheder fra variablen, som ikke længere findes, er ekskluderet eller deaktiveret,
+// og rens gamle metadatafelter for at forhindre "state-bloat" over tid.
 if (CONFIG.USE_STATE_HANDLING) {
+  const ALLOWED_STATE_KEYS = ['name', 'lastLevel', 'alertedAt', 'lowCount']; // Udvid denne liste, hvis scriptet udvides
   Object.keys(newDeviceStates).forEach(storedId => {
     if (!activeDeviceIds.has(storedId)) {
       delete newDeviceStates[storedId];
+    } else {
+      // Slet "spøgelses-metadata" (gamle properties fra tidligere versioner af scriptet)
+      Object.keys(newDeviceStates[storedId]).forEach(key => {
+        if (!ALLOWED_STATE_KEYS.includes(key)) {
+          delete newDeviceStates[storedId][key];
+        }
+      });
     }
   });
 }
@@ -459,10 +520,10 @@ if (CONFIG.USE_STATE_HANDLING && alertedDevicesVariable) {
   const newAlertedValue = JSON.stringify(newDeviceStates);
   if (newAlertedValue !== alertedDevicesVariable.value) {
     try {
-      await Homey.logic.updateVariable({
+      await withTimeout(Homey.logic.updateVariable({
         id: alertedDevicesVariable.id,
         variable: { value: newAlertedValue },
-      });
+      }), CONFIG.API_TIMEOUT_MS, 'Timeout ved gem af state-variabel');
       log(`Opdateret state-variabel.`);
     } catch (e) {
       log(`Fejl ved opdatering af state-variabel: ${e.message}`);
