@@ -50,6 +50,7 @@
 const CONFIG = {
   BATTERY_THRESHOLD: 15,                    // Procent – under dette sendes advarsel
   BATTERY_CRITICAL_THRESHOLD: 5,            // Ekstra advarsel ved meget lavt batteri
+  DEBOUNCE_POLLS: 2,                        // Antal på hinanden følgende kørsler med lavt batteri før alarm (filtrerer fejl 0%/NaN væk)
   REMINDER_DAYS: 7,                         // Antal dage før en påmindelse sendes for et uløst problem
   TAG_NAME: 'DeviceReport',                 // Tag til fuld rapport over ALLE enheder med lavt batteri
   ALERT_TAG_NAME: 'BatteryAlertToKenneth',  // Tag til alarm-besked med NYE problemer
@@ -59,7 +60,7 @@ const CONFIG = {
 
   CHECK_INACTIVITY: true,                   // Tjek om enheder er stoppet med at opdatere (døde enheder)
   MAX_INACTIVITY_HOURS: 168,                // Timer uden opdatering før enhed anses for inaktiv (168 = 7 dage)
-  INACTIVITY_CLASSES: ['sensor', 'motion', 'contactsensor', 'smokesensor', 'water'], // Enhedsklasser der overvåges for inaktivitet
+  INACTIVITY_CLASSES: ['sensor', 'motion', 'contactsensor', 'smokesensor', 'watersensor'], // Enhedsklasser der overvåges for inaktivitet
   // Enheder der sjældent rapporterer (f.eks. dørkontakt på gæsteværelse) kan ekskluderes fra inaktivitetstjek.
   EXCLUDE_INACTIVITY_DEVICES: [],           // Ignorer disse enheder KUN for inaktivitets-tjek, f.eks. ['Postkasse Sensor']
   
@@ -81,18 +82,56 @@ const CONFIG = {
   LOCK_TIMEOUT_MS: 30000,                   // 30 sekunder før en lås anses for forældet.
   MAX_MESSAGE_LENGTH: 8000,                 // Max længde for push-beskeder for at undgå trunkering.
   API_TIMEOUT_MS: 10000,                    // 10 sekunders timeout på API-kald for at undgå script-hang.
+  DEBUG_MODE: false,                        // Sæt til true for at aktivere detaljeret logging (anbefales sat til false i daglig drift).
 };
 
 // --- Start af script ---
 
+function debugLog(message) {
+  if (CONFIG.DEBUG_MODE) {
+    log(message);
+  }
+}
+
 // Funktion til at indkapsle asynkrone kald med en timeout
 function withTimeout(promise, ms, errorMessage) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(errorMessage || `Timeout efter ${ms}ms`)), ms)
-    )
-  ]);
+  const timeoutMessage = errorMessage || `Timeout efter ${ms}ms`;
+  const logMessage = `⏳ TIMEOUT: Scriptet blev reddet fra at hænge. Årsag: ${timeoutMessage}`;
+
+  if (typeof setTimeout === 'function' && typeof clearTimeout === 'function') {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        log(logMessage); // Altid log timeouts (kritisk)
+        reject(new Error(timeoutMessage));
+      }, ms);
+
+      promise
+        .then((res) => {
+          clearTimeout(timer); // Kaldet lykkedes, dræb timeren!
+          resolve(res);
+        })
+        .catch((err) => {
+          clearTimeout(timer); // Kaldet fejlede, dræb timeren!
+          reject(err);
+        });
+    });
+  } else if (typeof wait === 'function') {
+    // HomeyScript bruger ofte wait() i stedet for setTimeout
+    let isResolved = false;
+    const wrappedPromise = promise.then(
+      (res) => { isResolved = true; return res; },
+      (err) => { isResolved = true; throw err; }
+    );
+    const timeoutPromise = wait(ms).then(() => {
+      if (!isResolved) {
+        log(logMessage); // Altid log timeouts (kritisk)
+        throw new Error(timeoutMessage);
+      }
+    });
+    return Promise.race([wrappedPromise, timeoutPromise]);
+  } else {
+    return promise; // Fallback hvis ingen af timer-funktionerne findes
+  }
 }
 
 // Funktion til at parse state. Håndterer nu kun det nye ID-baserede JSON-format.
@@ -132,7 +171,8 @@ function truncateMessage(message, maxLength) {
 // Funktion til at opdatere et tag sikkert
 async function safeTagUpdate(name, value) {
   try {
-    await tag(name, value);
+    // Et tag-kald er også et API-kald, der kan hænge. Vi beskytter det.
+    await withTimeout(tag(name, value), CONFIG.API_TIMEOUT_MS, `Timeout ved opdatering af tag '${name}'`);
   } catch (e) {
     log(`Fejl ved opdatering af tag '${name}': ${e.message}`);
   }
@@ -149,11 +189,11 @@ async function getOrCreateVariable(name, type, defaultValue) {
       }
       return variable;
     }
-    log(`ℹ️ Logik-variablen '${name}' blev ikke fundet. Opretter den automatisk nu...`);
+    debugLog(`ℹ️ Logik-variablen '${name}' blev ikke fundet. Opretter den automatisk nu...`);
     const newVariable = await Homey.logic.createVariable({
       variable: { name: name, type: type, value: defaultValue }
     });
-    log(`✅ Variabel '${name}' oprettet succesfuldt!`);
+    debugLog(`✅ Variabel '${name}' oprettet succesfuldt!`);
     return newVariable;
   } catch (e) {
     throw new Error(`Kunne ikke finde/oprette variabel '${name}': ${e.message}`);
@@ -175,10 +215,10 @@ if (CONFIG.USE_STATE_HANDLING) {
     if (lockVariable.value !== '') {
       const lastModified = lockVariable.lastUpdated ? new Date(lockVariable.lastUpdated).getTime() : 0;
       if (Date.now() - lastModified < CONFIG.LOCK_TIMEOUT_MS) {
-        log('Scriptet kører allerede. Afslutter for at undgå race condition.');
+        debugLog('Scriptet kører allerede. Afslutter for at undgå race condition.');
         return false; // Afslut stille
       }
-      log('ADVARSEL: Låsevariabel var aktiv, men er udløbet. Overtager låsen.');
+      debugLog('ADVARSEL: Låsevariabel var aktiv, men er udløbet. Overtager låsen.');
     }
     // Sæt lås
     await Homey.logic.updateVariable({ id: lockVariable.id, variable: { value: myLockToken } });
@@ -191,7 +231,7 @@ if (CONFIG.USE_STATE_HANDLING) {
     }
     const lockCheck = await Homey.logic.getVariables();
     if (lockCheck[lockVariable.id] && lockCheck[lockVariable.id].value !== myLockToken) {
-      log('Race condition detekteret: En anden instans tog låsen i mellemtiden.');
+      debugLog('Race condition detekteret: En anden instans tog låsen i mellemtiden.');
       return false;
     }
   } catch (e) {
@@ -203,11 +243,11 @@ if (CONFIG.USE_STATE_HANDLING) {
 }
 
 if (CONFIG.USE_STATE_HANDLING) {
-  log('Kører i avanceret tilstand (med state-håndtering).');
+  debugLog('Kører i avanceret tilstand (med state-håndtering).');
   try {
     alertedDevicesVariable = await getOrCreateVariable(CONFIG.STATE_VARIABLE_NAME, 'string', '');
   } catch (e) {
-    log(`Fejl: ${e.message}`);
+    log(`Fejl under initialisering af state-variabel: ${e.message}`);
     await safeTagUpdate(CONFIG.ALERT_TAG_NAME, e.message);
     // Frigiv lås før afslutning
     if (lockVariable) await Homey.logic.updateVariable({ id: lockVariable.id, variable: { value: '' } });
@@ -216,12 +256,12 @@ if (CONFIG.USE_STATE_HANDLING) {
   // Indlæs og parse state fra Homey-variabel
   deviceStates = parseAlertState(alertedDevicesVariable.value);
 } else {
-  log('Kører i simpel tilstand (uden state-håndtering).');
+  debugLog('Kører i simpel tilstand (uden state-håndtering).');
 }
 
 try {
   // Hovedlogik
-  const result = await mainLogic();
+  const result = await mainLogic(deviceStates, alertedDevicesVariable);
   return result;
 } catch (e) {
   log(`Uventet fejl i scriptets hovedlogik: ${e.message}`);
@@ -235,7 +275,7 @@ try {
       const lockCheck = await Homey.logic.getVariables();
       if (lockCheck[lockVariable.id] && lockCheck[lockVariable.id].value === myLockToken) {
         await Homey.logic.updateVariable({ id: lockVariable.id, variable: { value: '' } });
-        log('Lås frigivet.');
+        debugLog('Lås frigivet.');
       }
     } catch (e) {
       log(`Fejl ved frigivelse af lås: ${e.message}`);
@@ -243,7 +283,7 @@ try {
   }
 }
 
-async function mainLogic() {
+async function mainLogic(deviceStates, alertedDevicesVariable) {
   const newDeviceStates = JSON.parse(JSON.stringify(deviceStates)); // Dyb kopi til at arbejde med
   
   // Optimering 1: Hent enheder og zoner parallelt
@@ -278,13 +318,13 @@ const activeDeviceIds = new Set(); // Holder styr på enheder der er med i dette
 for (const device of sortedDevices) {
   // Spring over deaktiverede enheder
   if (device.disabled === true) {
-    log(`Ignorerer ${device.name} (Deaktiveret)`);
+    debugLog(`Ignorerer ${device.name} (Deaktiveret)`);
     ignoredCount++;
     continue;
   }
   // Spring over ekskluderede enheder defineret i CONFIG
   if (excludedDevicesSet.has(device.name)) {
-    log(`Ignorerer ${device.name} (Ekskluderet i CONFIG)`);
+    debugLog(`Ignorerer ${device.name} (Ekskluderet i CONFIG)`);
     ignoredCount++;
     continue;
   }
@@ -341,7 +381,7 @@ for (const device of sortedDevices) {
 
   let debounceActive = false;
   if (CONFIG.USE_STATE_HANDLING && currentLowCount > 0 && currentLowCount < CONFIG.DEBOUNCE_POLLS) {
-    log(`⏳ Debouncer mulig batterifejl for ${deviceName} (${batteryLevel}%, kørsel ${currentLowCount}/${CONFIG.DEBOUNCE_POLLS})`);
+    debugLog(`⏳ Debouncer mulig batterifejl for ${deviceName} (${batteryLevel}%, kørsel ${currentLowCount}/${CONFIG.DEBOUNCE_POLLS})`);
     debounceActive = true;
   }
 
@@ -356,9 +396,8 @@ for (const device of sortedDevices) {
   if (CONFIG.CHECK_INACTIVITY && isSecuritySensor && device.capabilitiesObj && !isExcludedFromInactivity) {
     let lastUpdateTs = 0;
     // Find den nyeste opdatering på tværs af alle capabilities (temp, batteri, motion osv.)
-    for (const capKey in device.capabilitiesObj) {
-      const cap = device.capabilitiesObj[capKey];
-      if (cap.lastUpdated) {
+    for (const cap of Object.values(device.capabilitiesObj)) {
+      if (cap && cap.lastUpdated) {
         const ts = new Date(cap.lastUpdated).getTime();
         if (ts > lastUpdateTs) lastUpdateTs = ts;
       }
@@ -376,7 +415,7 @@ for (const device of sortedDevices) {
   // Ignorer enheder med 100% batteri, hvis konfigureret (fanger ofte USB-enheder)
   // UNDTAGELSE: Hvis enheden er inaktiv (død), skal vi advare selvom den siger 100%
   if (CONFIG.IGNORE_100_PERCENT_BATTERY && batteryLevel === 100 && batteryCap && !isInactive) {
-    log(`Ignorerer ${deviceName} (Batteri er 100%)`);
+    debugLog(`Ignorerer ${deviceName} (Batteri er 100%)`);
     ignoredCount++;
     continue;
   }
@@ -465,7 +504,8 @@ for (const device of sortedDevices) {
     }
   } else if (CONFIG.USE_STATE_HANDLING && currentState?.alertedAt) {
     // Problem løst! Batteriniveau er OK, og der var en tidligere alarm.
-    resolvedReport += `✅ ${currentState.name || deviceName} (${room}): Batteri OK (${batteryLevel}%)\n`;
+    const resolvedBatteryText = batteryCap ? `Batteri OK (${batteryLevel}%)` : 'Batterialarm fjernet';
+    resolvedReport += `✅ ${currentState.name || deviceName} (${room}): ${resolvedBatteryText}\n`;
     delete newDeviceStates[deviceId].alertedAt;
   }
 }
@@ -524,26 +564,26 @@ if (CONFIG.USE_STATE_HANDLING && alertedDevicesVariable) {
         id: alertedDevicesVariable.id,
         variable: { value: newAlertedValue },
       }), CONFIG.API_TIMEOUT_MS, 'Timeout ved gem af state-variabel');
-      log(`Opdateret state-variabel.`);
+      debugLog(`Opdateret state-variabel.`);
     } catch (e) {
       log(`Fejl ved opdatering af state-variabel: ${e.message}`);
     }
   }
 }
 
-log('---------------------------------------------------');
-log(`Opsummering: ${ignoredCount} enhed(er) blev ignoreret (Deaktiveret, ekskluderet eller 100% batteri).`);
+debugLog('---------------------------------------------------');
+debugLog(`Opsummering: ${ignoredCount} enhed(er) blev ignoreret (Deaktiveret, ekskluderet eller 100% batteri).`);
 
 // Push-notifikation (kun nye alarmer og løste problemer)
 if (finalAlertMessage) {
   finalAlertMessage = truncateMessage(finalAlertMessage, CONFIG.MAX_MESSAGE_LENGTH);
-  log(`Sender alarm: ${finalAlertMessage}`);
+  debugLog(`Sender alarm: ${finalAlertMessage}`);
   if (CONFIG.ENABLE_PUSH) {
     await safeTagUpdate(CONFIG.ALERT_TAG_NAME, finalAlertMessage);
   }
   return true; // Indikerer at der var noget at rapportere
 } else {
-  log('Ingen nye batteriproblemer eller løste sager at rapportere.');
+  debugLog('Ingen nye batteriproblemer eller løste sager at rapportere.');
   return false; // Indikerer at der ikke var noget nyt
 }
 }
