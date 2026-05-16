@@ -42,6 +42,9 @@ const DEBUG_MODE = false;
 // Timeout for API-kald i millisekunder (f.eks. 15000 = 15 sekunder)
 const API_TIMEOUT_MS = 15000;
 
+// Tærskel for hvornår scriptet skal bruge pauser for at beskytte CPU (antal flows)
+const SMART_DELAY_THRESHOLD = 80;
+
 async function findBrokenCards() {
     function log(...args) {
         if (!SILENT_MODE) console.log(...args);
@@ -103,6 +106,25 @@ async function findBrokenCards() {
     const validZoneIds = new Set(Object.keys(zones));
     const validUserIds = new Set(Object.keys(users));
     const validFlowIds = new Set([...Object.keys(flows), ...Object.keys(advancedFlows)]);
+
+    const totalFlowsCount = Object.keys(flows).length + Object.keys(advancedFlows).length;
+    const useSmartDelay = totalFlowsCount > SMART_DELAY_THRESHOLD;
+
+    if (useSmartDelay) {
+        log(`⏱️ Intelligent Delay aktiveret (beskytter CPU ved ${totalFlowsCount} flows).`);
+    } else {
+        log(`⚡ Turbomode aktiveret (${totalFlowsCount} flows - ingen pauser).`);
+    }
+
+    let flowProcessCount = 0;
+    async function applyBatchDelay() {
+        if (!useSmartDelay) return;
+        flowProcessCount++;
+        if (flowProcessCount % 10 === 0) {
+            if (typeof wait === 'function') await wait(100);
+            else await new Promise(res => setTimeout(res, 100));
+        }
+    }
 
     // Hent alle Tokens (Tags) - Vi starter med Logic-variabler, da de også er tokens
     let validTokenIds = new Set(validVarIds); 
@@ -357,17 +379,6 @@ async function findBrokenCards() {
             }
         }
         log(''); // Tilføj et linjeskift for læsbarhed
-    }
-
-    // --- Batch Delay Helper ---
-    // Frigiver CPU'en i 100ms for hver 10 flows der behandles, så vi ikke låser Homey
-    let processedFlowsCount = 0;
-    async function applyBatchDelay() {
-        processedFlowsCount++;
-        if (processedFlowsCount % 10 === 0) {
-            if (typeof wait === 'function') await wait(100);
-            else await new Promise(r => setTimeout(r, 100));
-        }
     }
 
     // 3. Tjek Standard Flows
