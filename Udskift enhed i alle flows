@@ -13,11 +13,19 @@
  * - Swap (Bytte): Kan bytte om på to enheder, så de overtager hinandens plads (valgfrit).
  * - Dry-run: Test ændringerne sikkert i loggen uden at gemme noget (anbefales først).
  * - Tjek af Capabilities: Advarer hvis den nye enhed mangler funktioner som den gamle havde.
+ *   Alle flow-kort scannes for mange kendte capability-referencer, uanset om kortet
+ *   blev ændret. Udskiftningen er uændret. Scanningen kan ikke garantere at fange
+ *   alle Homeys repræsentationer.
  * 
  * Vejledning:
  * 1. Indtast de præcise navne på dine enheder i 'oldDeviceName' og 'newDeviceName'.
  * 2. Behold 'dryRun = true' og kør scriptet for at se ændringerne i loggen.
  * 3. Ret 'dryRun = false' og kør scriptet igen for rent faktisk at gemme ændringerne.
+ *
+ * Rettigheder:
+ * Læsning af flows kan virke uden skrivetilladelse. Gemning via updateFlow /
+ * updateAdvancedFlow kræver homey.flow-scope. Uden det får du Missing Scopes,
+ * selvom scriptet finder og ændrer kortene i hukommelsen.
  * ==============================================================================
  */
 
@@ -63,6 +71,10 @@ async function main() {
     const oldDevice = oldDevices[0];
     const newDevice = newDevices[0];
 
+    if (oldDevice.id === newDevice.id) {
+        return log(`❌ Fejl: Den gamle og den nye enhed er den samme enhed.`);
+    }
+
     if (swapDevices) {
         log(`🔄 SWAP AKTIVERET: Bytter om på '${oldDevice.name}' og '${newDevice.name}' i alle flows...`);
     } else {
@@ -74,22 +86,79 @@ async function main() {
         log(`\n⚠️  ADVARSEL: Enhederne er ikke af samme type! (${oldDevice.class} vs ${newDevice.class})`);
     }
     
-    // Tjek om den nye enhed mangler capabilities som den gamle havde
-    const missingCaps = oldDevice.capabilities.filter(c => !newDevice.capabilities.includes(c));
+    const oldCaps = Array.isArray(oldDevice.capabilities) ? oldDevice.capabilities : [];
+    const newCaps = Array.isArray(newDevice.capabilities) ? newDevice.capabilities : [];
+
+    const missingCaps = oldCaps.filter(c => !newCaps.includes(c));
     if (missingCaps.length > 0) {
         log(`⚠️  ADVARSEL: Den nye enhed mangler følgende funktioner: ${missingCaps.join(', ')}`);
         log(`    Flows der bruger disse funktioner vil sandsynligvis fejle!\n`);
     }
-    
-    // Ved swap: Tjek også den modsatte vej (hvis vi flytter fra Ny -> Gammel)
-    const reverseMissingCaps = newDevice.capabilities.filter(c => !oldDevice.capabilities.includes(c));
+
+    const reverseMissingCaps = newCaps.filter(c => !oldCaps.includes(c));
     if (swapDevices && reverseMissingCaps.length > 0) {
         log(`⚠️  ADVARSEL (Swap): Den gamle enhed mangler funktioner som den nye enhed har: ${reverseMissingCaps.join(', ')}`);
     }
 
+    const missingCapSet = new Set(missingCaps);
+    const reverseMissingCapSet = new Set(swapDevices ? reverseMissingCaps : []);
+    const capsToScan = [...missingCapSet, ...reverseMissingCapSet].sort((a, b) => b.length - a.length);
+
+    // Finder mange kendte capability-referencer (cap, cap_true, cap.sub). Ikke en garanti for alle Homey-formater.
+    const matchCapInString = (str, hits) => {
+        if (!str || typeof str !== 'string' || capsToScan.length === 0) return;
+        const candidates = str.includes(':') ? [str, str.split(':').pop()] : [str];
+        for (const candidate of candidates) {
+            for (const cap of capsToScan) {
+                if (candidate === cap || candidate.startsWith(cap + '_') || candidate.startsWith(cap + '.')) {
+                    hits.add(cap);
+                    break;
+                }
+            }
+        }
+    };
+
+    const collectCapHits = (value, hits, seen) => {
+        if (!value || capsToScan.length === 0) return;
+        if (typeof value === 'string') {
+            matchCapInString(value, hits);
+            return;
+        }
+        if (typeof value !== 'object') return;
+        if (seen.has(value)) return;
+        seen.add(value);
+        if (Array.isArray(value)) {
+            for (const item of value) collectCapHits(item, hits, seen);
+            return;
+        }
+        for (const key of Object.keys(value)) {
+            if (key === 'title' || key === 'titleFormatted' || key === 'name') continue;
+            matchCapInString(key, hits);
+            collectCapHits(value[key], hits, seen);
+        }
+    };
+
     let count = 0;
     let totalMatches = 0;
     const riskyFlows = [];
+
+    const reportCapabilityRisk = (card, flowName) => {
+        if (capsToScan.length === 0) return;
+        const hits = new Set();
+        collectCapHits(card, hits, new WeakSet());
+        for (const cap of hits) {
+            let where;
+            if (missingCapSet.has(cap) && reverseMissingCapSet.has(cap)) {
+                where = 'mangler på begge enheder';
+            } else if (missingCapSet.has(cap)) {
+                where = `mangler på '${newDevice.name}'`;
+            } else {
+                where = `mangler på '${oldDevice.name}' ved swap`;
+            }
+            const msg = `Flow '${flowName}' bruger '${cap}' (${where})`;
+            if (!riskyFlows.includes(msg)) riskyFlows.push(msg);
+        }
+    };
 
     // Pre-kompiler RegExp for 'swap' så den ikke genereres tusindvis af gange i rekursionen
     const swapRegex = new RegExp(`${escapeRegExp(oldDevice.id)}|${escapeRegExp(newDevice.id)}`, 'g');
@@ -97,14 +166,15 @@ async function main() {
     // Hjælpefunktion til at søge og erstatte i flow-kort
     const processCards = (cards, flowName, section = 'Kort') => {
         let changed = false;
-        if (!Array.isArray(cards)) return false;
+        if (!cards) return false;
+        const list = Array.isArray(cards) ? cards : [cards];
         
         // Rekursiv funktion til at håndtere nested objekter og tekst-strenge
         const traverseAndReplace = (obj, path = '') => {
             let modified = false;
             if (!obj || typeof obj !== 'object') return false;
 
-            for (const key in obj) {
+            for (const key of Object.keys(obj)) {
                 const val = obj[key];
                 const currentPath = path ? `${path}.${key}` : key;
 
@@ -189,7 +259,7 @@ async function main() {
             return modified;
         };
 
-        for (const card of cards) {
+        for (const card of list) {
             let cardChanged = false;
             // Tjek Owner URI (VIGTIGT: Dette håndterer triggers/actions der "tilhører" enheden)
             if (card.ownerUri && card.ownerUri.includes(oldDevice.id)) {
@@ -220,17 +290,9 @@ async function main() {
                 cardChanged = true;
             }
 
-            if (cardChanged) {
-                changed = true;
-                // Tjek om kortet bruger en manglende capability (Brug ?. for at undgå fejl hvis args mangler)
-                if (missingCaps.length > 0) {
-                    const usedCap = card.group || card.args?.capability;
-                    if (usedCap && missingCaps.includes(usedCap)) {
-                        const msg = `Flow '${flowName}' bruger '${usedCap}'`;
-                        if (!riskyFlows.includes(msg)) riskyFlows.push(msg);
-                    }
-                }
-            }
+            if (cardChanged) changed = true;
+            // Tjek alle kort for manglende capabilities — også dem, der ikke udskiftes.
+            reportCapabilityRisk(card, flowName);
         }
         return changed;
     };
@@ -251,8 +313,14 @@ async function main() {
             count++;
             if (!dryRun) {
                 try {
+                    // Korrekt API: updateFlow({ id, flow }). Kræver homey.flow-scope (skrivning).
                     await Homey.flow.updateFlow({ id: flow.id, flow: flow });
-                } catch (err) { log(`   ❌ Fejl ved opdatering af flow '${flow.name}':`, err); }
+                } catch (err) {
+                    log(`   ❌ Fejl ved opdatering af flow '${flow.name}':`, err);
+                    if (String(err).includes('Missing Scopes') || String(err.message || '').includes('scope')) {
+                        log('   ℹ️  Gemning kræver homey.flow-scope. Læsning kan virke, mens skrivning afvises.');
+                    }
+                }
                 await wait(50); // Lille pause for stabilitet
             }
         }
@@ -267,8 +335,16 @@ async function main() {
             count++;
             if (!dryRun) {
                 try {
-                    await Homey.flow.updateAdvancedFlow({ id: flow.id, flow: flow });
-                } catch (err) { log(`   ❌ Fejl ved opdatering af Advanced Flow '${flow.name}':`, err); }
+                    await Homey.flow.updateAdvancedFlow({
+                        id: flow.id,
+                        advancedflow: flow
+                    });
+                } catch (err) {
+                    log(`   ❌ Fejl ved opdatering af Advanced Flow '${flow.name}':`, err);
+                    if (String(err).includes('Missing Scopes') || String(err.message || '').includes('scope')) {
+                        log('   ℹ️  Gemning kræver homey.flow-scope. Læsning kan virke, mens skrivning afvises.');
+                    }
+                }
                 await wait(50); // Lille pause for stabilitet
             }
         }
@@ -326,7 +402,8 @@ async function main() {
     log(`Færdig! ${count} flows ${dryRun ? "ville blive" : "blev"} opdateret (i alt ${totalMatches} udskiftninger).`);
     
     if (riskyFlows.length > 0) {
-        log("\n⚠️  Følgende flows vil sandsynligvis fejle pga. manglende capabilities:");
+        log("\n⚠️  Følgende flows har kendte capability-referencer, som den anden enhed mangler:");
+        log("    (Ikke en komplet liste — Homey kan gemme capabilities på flere måder.)");
         riskyFlows.forEach(f => log(`   - ${f}`));
     }
 
